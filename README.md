@@ -103,6 +103,29 @@ graph TD
     H --> I
 ```
 
+### 🔧 Fase 1: Riparazione del Binario (Struttura del File)
+
+Prima di analizzare i pixel, il programma ripara il file come sequenza di byte.
+
+- **Analisi dei Marcatori**: Riconosce e ripristina l'intestazione (SOI) e la fine (EOI) del JPEG.
+- **Decodifica Huffman**: Scansiona i blocchi MCU. Se trova un errore di decodifica (es. un bit corrotto), taglia i dati in quel punto esatto per evitare che il decoder generi "rumore" a caso.
+- **Recupero da Troncamento**: Se il file è incompleto, reinserisce i blocchi di chiusura per salvare tutta la parte sana dell'immagine.
+
+### 🔍 Fase 2: Analisi Visiva (Ricerca dei Danni)
+
+Una volta che il file è strutturalmente valido, il programma cerca i danni nei pixel.
+
+- **Rilevamento della Varianza**: Cerca aree perfettamente piatte (varianza vicina a zero) che hanno i colori tipici degli errori di compressione (Grigio 128, Nero puro, o "glitch" Neon).
+- **Creazione della Maschera**: Genera una mappa (maschera) in cui i pixel bianchi indicano esattamente all'AI dove sono i buchi da riempire, preservando il resto della foto.
+
+### 🤖 Fase 3: Ricostruzione AI (Inpainting & Volti)
+
+La maschera viene passata a due modelli di Deep Learning per riempire le zone mancanti in modo intelligente.
+
+- **LaMa**: Analizza il contesto circostante (muri, cielo, strada) e riempie i buchi in modo coerente, senza sfocare.
+- **GFPGAN**: Se la maschera tocca un volto umano, un modello dedicato ripristina occhi, naso e bocca in modo realistico.
+- **Blending (Fusione)**: L'immagine originale e quella ricostruita vengono fuse con una sfumatura per nascondere i bordi della riparazione.
+
 ---
 
 ## Licenza
