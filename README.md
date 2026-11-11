@@ -1,4 +1,4 @@
-# RiparaFoto 📸✨
+# RiparaFoto 
 
 Software open-source per il ripristino avanzato e la ricostruzione intelligente di fotografie danneggiate, corrotte o incomplete.
 
