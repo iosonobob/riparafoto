@@ -30,7 +30,7 @@ Combina l'analisi strutturale a basso livello del binario JPEG/PNG con modelli d
 
 1. **Clona il repository**:
    ```bash
-   git clone https://github.com/TUO_USERNAME/riparafoto.git
+   git clone https://github.com/iosonobob/riparafoto.git
    cd riparafoto
    ```
 
