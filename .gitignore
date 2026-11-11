@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch & AI Model Weights
+*.pth
+*.pt
+*.bin
+*.onnx
+gfpgan/
+weights/
+
+# Output directories & test files
+riparate/
+output/
+out_*/
+*.log
+rapporto_riparafoto.txt
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
