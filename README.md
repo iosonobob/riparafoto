@@ -85,6 +85,26 @@ Dalla schermata potrai aggiungere foto, scegliere la cartella dove salvare i ris
 
 ---
 
+## Pipeline di elaborazione
+
+Il programma elabora ogni immagine attraverso tre fasi sequenziali, dal livello più "fisico" (i byte) a quello più "visivo" (i pixel).
+
+```mermaid
+graph TD
+    A[File Danneggiato] --> B{1. Riparazione Binaria}
+    B -->|Struttura OK| C[Analisi Strutturale]
+    B -->|Riparato| C
+    C --> D{2. Analisi Visiva}
+    D -->|Nessun Danno| E[Salva Copia Integra]
+    D -->|Danni Rilevati| F[3. Ricostruzione AI]
+    F -->|Inpainting| G[LaMa / OpenCV]
+    F -->|Volti| H[GFPGAN]
+    G --> I[Salvataggio Finale]
+    H --> I
+```
+
+---
+
 ## Licenza
 
 Questo progetto è rilasciato sotto licenza [MIT](LICENSE).
