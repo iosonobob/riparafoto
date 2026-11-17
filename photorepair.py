@@ -649,8 +649,7 @@ def repair_baseline_v2(data: bytes, segs, params, results, margin: int = 4):
     for s in segs[:ecs_i]: out += data[s.start:s.end]
     kept = 0
     prev_last_dc = None
-    lost_mcus: list[int] = []
-    base_mcu = 0
+    bad: list[tuple[int, int, int, int]] = []
     for k, (n_ok, starts, reason, pos, first_dc, last_dc, buf, n_mcu) in enumerate(results):
         if k: out += bytes([0xFF, 0xD0 + (k - 1) % 8])
         dc_incoherent = False
@@ -667,18 +666,17 @@ def repair_baseline_v2(data: bytes, segs, params, results, margin: int = 4):
             piece = _cut_bits(buf, pos)
         elif dc_incoherent:
             piece = b""
-            lost_mcus.extend(range(base_mcu, base_mcu + n_mcu))
+            bad.append((k, n_mcu, 0, n_mcu))
         else:
             keep = max(0, n_ok - margin)
             kept += keep
             piece = _cut_bits(buf, starts[keep] if keep < len(starts) else pos)
-            lost_mcus.extend(range(base_mcu + keep, base_mcu + n_mcu))
+            bad.append((k, n_mcu, keep, n_mcu))
         out += piece.replace(b"\xff", b"\xff\x00")
         if reason is None or not dc_incoherent: prev_last_dc = last_dc
         else: prev_last_dc = None
-        base_mcu += n_mcu
     out += b"\xff\xd9"
-    return bytes(out), kept / params["mcus"], lost_mcus
+    return bytes(out), kept / params["mcus"], bad
 
 def repair_baseline(data: bytes, segs, params, results, margin: int = 4):
     return repair_baseline_v2(data, segs, params, results, margin)
@@ -730,46 +728,23 @@ def _find_visual_glitches_safe(a: np.ndarray, force: bool = False) -> np.ndarray
     dilated = cv2.dilate(filtered, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)))
     return dilated
 
-def _structural_mask_from_lost_mcus(im: Image.Image, lost_mcus: list[int], params: dict) -> np.ndarray:
-    w, h = im.size
-    mask = np.zeros((h, w), dtype=np.uint8)
-    if not lost_mcus: return mask
-    hmax = params.get("hmax", 2)
-    vmax = params.get("vmax", 2)
-    mcu_w = 8 * hmax
-    mcu_h = 8 * vmax
-    mcus_per_row = (w + mcu_w - 1) // mcu_w
-    for mcu_idx in lost_mcus:
-        if mcu_idx >= params["mcus"]: continue
-        r = mcu_idx // mcus_per_row
-        c = mcu_idx % mcus_per_row
-        y1 = r * mcu_h
-        y2 = min(h, y1 + mcu_h)
-        x1 = c * mcu_w
-        x2 = min(w, x1 + mcu_w)
-        mask[y1:y2, x1:x2] = 255
-    return cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+def mask_from_lost(w, h, params, bad, ri, mx):
+    hmax, vmax = params["hmax"], params["vmax"]
+    mcu_w, mcu_h = 8 * hmax, 8 * vmax
+    mask = np.zeros((h, w), np.uint8)
+    for k, n_mcu, a, b in bad:
+        for m in range(a, b):
+            idx = k * ri + m
+            r, c = idx // mx, idx % mx
+            y1, x1 = r * mcu_h, c * mcu_w
+            mask[y1:min(h, y1 + mcu_h), x1:min(w, x1 + mcu_w)] = 255
+    return cv2.dilate(mask, np.ones((5, 5), np.uint8))
 
-def _structural_mask_from_intervals(im: Image.Image, bad_intervals, params: dict) -> np.ndarray:
-    if not bad_intervals: return np.zeros((im.size[1], im.size[0]), dtype=np.uint8)
-    if isinstance(bad_intervals[0], int):
-        return _structural_mask_from_lost_mcus(im, bad_intervals, params)
-    w, h = im.size
-    mask = np.zeros((h, w), dtype=np.uint8)
-    hmax = params.get("hmax", 2)
-    vmax = params.get("vmax", 2)
-    mcu_w = 8 * hmax
-    mcu_h = 8 * vmax
-    ri = max(1, params.get("ri", 1))
-    mcus_per_row = (w + mcu_w - 1) // mcu_w
-    for k, total_mcus, start_bad, end_bad in bad_intervals:
-        idx_start = k * ri + start_bad
-        idx_end = k * ri + end_bad - 1
-        for mcu_idx in range(idx_start, min(idx_end + 1, params["mcus"])):
-            r = mcu_idx // mcus_per_row
-            c = mcu_idx % mcus_per_row
-            mask[r * mcu_h:min(h, (r + 1) * mcu_h), c * mcu_w:min(w, (c + 1) * mcu_w)] = 255
-    return cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+def _structural_mask_from_intervals(im: Image.Image, bad, params: dict) -> np.ndarray:
+    if not bad: return np.zeros((im.size[1], im.size[0]), dtype=np.uint8)
+    ri = params.get("ri", 0)
+    mx = params.get("mx", (im.size[0] + 8 * params.get("hmax", 2) - 1) // (8 * params.get("hmax", 2)))
+    return mask_from_lost(im.size[0], im.size[1], params, bad, ri, mx)
 
 def lama_inpaint_tiled(lama, rgb: np.ndarray, mask: np.ndarray, tile_size: int = 1024, overlap: int = 256) -> np.ndarray:
     if lama is None or mask.max() == 0:
@@ -827,43 +802,7 @@ def lama_inpaint_tiled(lama, rgb: np.ndarray, mask: np.ndarray, tile_size: int =
     inpainted[has_w] = accum_img[has_w] / accum_weight[has_w, None]
     return np.clip(inpainted, 0, 255).astype(np.uint8)
 
-def restore_faces_selective(rgb: np.ndarray | Image.Image, mask: np.ndarray, gfpgan) -> np.ndarray:
-    if gfpgan is None:
-        return np.array(rgb)
-    img_np = np.array(rgb.convert("RGB") if isinstance(rgb, Image.Image) else rgb)
-    h, w = img_np.shape[:2]
-    bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-
-    try:
-        _, _, restored_bgr = gfpgan.enhance(bgr, has_aligned=False, only_center_face=False, paste_back=True)
-    except Exception:
-        return img_np
-    if restored_bgr is None:
-        return img_np
-
-    restored_rgb = cv2.cvtColor(restored_bgr, cv2.COLOR_BGR2RGB)
-    damaged_face_mask = np.zeros((h, w), dtype=np.float32)
-    has_damaged_face = False
-
-    if hasattr(gfpgan, "face_helper") and hasattr(gfpgan.face_helper, "det_faces") and gfpgan.face_helper.det_faces:
-        for det in gfpgan.face_helper.det_faces:
-            x1, y1, x2, y2 = [int(v) for v in det[:4]]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-            if mask[y1:y2, x1:x2].any():
-                has_damaged_face = True
-                pad_x = int((x2 - x1) * 0.1)
-                pad_y = int((y2 - y1) * 0.1)
-                fx1, fy1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
-                fx2, fy2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
-                damaged_face_mask[fy1:fy2, fx1:fx2] = 1.0
-
-    if not has_damaged_face:
-        return img_np
-
-    damaged_face_mask = cv2.GaussianBlur(damaged_face_mask, (21, 21), 0)[..., None]
-    final_rgb = img_np * (1.0 - damaged_face_mask) + restored_rgb * damaged_face_mask
-    return np.clip(final_rgb, 0, 255).astype(np.uint8)
+from photorepair_extras import restore_faces_selective
 
 def blend_masked(orig: Image.Image, new: Image.Image, mask_np: np.ndarray, feather: int = 15) -> Image.Image:
     """Seamlessly blends new content over the original, preserving unmasked healthy pixels."""
@@ -922,17 +861,21 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
         engine = "OpenCV (fallback)"
 
     # Face restoration with GFPGAN (selectively applied only to faces intersecting damaged regions)
+    from photorepair_extras import restore_faces_selective
+
     gfpgan = _get_gfpgan()
-    if gfpgan is not None:
-        try:
-            rep(0.85, "evaluating damaged faces for selective restoration (GFPGAN)...")
-            res_rgb = np.array(res.convert("RGB"))
-            restored_rgb = restore_faces_selective(res_rgb, mask_combined, gfpgan)
-            if not np.array_equal(res_rgb, restored_rgb):
-                res = Image.fromarray(restored_rgb)
-                engine += " + GFPGAN"
-        except Exception as e:
-            error_log.append(f"GFPGAN failed: {e}")
+    if gfpgan is not None and mask_combined.any():
+        rgb_out = np.array(res.convert("RGB"))
+        rgb_out, face_info = restore_faces_selective(
+            rgb_out, mask_combined, gfpgan,
+            det_thr=0.55,      # il default 0.97 è troppo severo per volti rovinati
+            min_damage=0.02,   # tocca solo i volti che intersecano il danno
+            strength=0.85,
+        )
+        res = Image.fromarray(rgb_out)
+        engine += " + GFPGAN(selettivo)"
+        for f in face_info:
+            error_log.append(f"volto {f.get('box')}: {f['azione']}")
     
     if alpha is not None: res.putalpha(alpha)
     
@@ -1000,11 +943,13 @@ def process(path: Path, outdir: Path, opts: Options | None = None, report=None) 
                         if params:
                             results = check_baseline(data, segs, params, lambda f, m: rep(0.05 + 0.15 * f, m))
                             if any(r[2] for r in results):
-                                data, binary_recovered, lost_mcus = repair_baseline_v2(data, segs, params, results)
+                                data, binary_recovered, bad = repair_baseline_v2(data, segs, params, results)
                                 im_temp, _ = decode(data)
                                 if im_temp:
-                                    structural_mask = _structural_mask_from_lost_mcus(im_temp, lost_mcus, params)
-                                notes.append(f"repaired binary: {binary_recovered:.0%} recovered, {len(lost_mcus)} lost MCUs masked")
+                                    ri = params.get("ri", 0)
+                                    mx = params["mx"]
+                                    structural_mask = mask_from_lost(im_temp.width, im_temp.height, params, bad, ri, mx)
+                                notes.append(f"repaired binary: {binary_recovered:.0%} recovered, {len(bad)} damaged intervals corrected")
         except Exception as e:
             details.append(f"binary check failed: {e}")
 
