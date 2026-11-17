@@ -45,17 +45,38 @@ try:
     import torch
     TORCH_AVAILABLE = True
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    DEVICE_OBJ = torch.device(DEVICE)
-    print(f"\n{'='*60}")
-    if DEVICE == "cuda":
-        gpu_name = torch.cuda.get_device_name(0)
-        print(f"[SYSTEM] ✅ GPU DETECTED: {gpu_name}")
-    else:
-        print("[WARNING] GPU not found. AI will run on CPU (slower).")
 except ImportError:
+    torch = None
     DEVICE = "cpu"
-    DEVICE_OBJ = None
-    print("\n[WARN] PyTorch not installed. AI features disabled.")
+
+# Auto-respawn with CUDA-enabled Python if current interpreter lacks GPU
+if DEVICE != "cuda" and not os.environ.get("_PHOTOREPAIR_CUDA_RESPAWNED"):
+    _candidates = [
+        r"C:\Program Files\Python312\python.exe",
+        r"C:\Program Files\Python311\python.exe",
+        r"C:\Program Files\Python310\python.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python312\python.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python311\python.exe"),
+    ]
+    for _cand in _candidates:
+        if os.path.isfile(_cand) and os.path.abspath(_cand).lower() != os.path.abspath(sys.executable).lower():
+            try:
+                _chk = subprocess.run([_cand, "-c", "import torch; exit(0 if torch.cuda.is_available() else 1)"], capture_output=True, timeout=5)
+                if _chk.returncode == 0:
+                    os.environ["_PHOTOREPAIR_CUDA_RESPAWNED"] = "1"
+                    sys.exit(subprocess.call([_cand] + sys.argv))
+            except Exception:
+                pass
+
+DEVICE_OBJ = torch.device(DEVICE) if TORCH_AVAILABLE else None
+print(f"\n{'='*60}")
+if DEVICE == "cuda":
+    gpu_name = torch.cuda.get_device_name(0)
+    print(f"[SYSTEM] ✅ GPU DETECTED: {gpu_name}")
+elif TORCH_AVAILABLE:
+    print("[WARNING] GPU not found. AI will run on CPU (slower).")
+else:
+    print("[WARN] PyTorch not installed. AI features disabled.")
 
 # 1. LaMa
 _LAMA = None
