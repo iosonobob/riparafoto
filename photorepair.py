@@ -49,25 +49,6 @@ except ImportError:
     torch = None
     DEVICE = "cpu"
 
-# Auto-respawn with CUDA-enabled Python if current interpreter lacks GPU
-if DEVICE != "cuda" and not os.environ.get("_PHOTOREPAIR_CUDA_RESPAWNED"):
-    _candidates = [
-        r"C:\Program Files\Python312\python.exe",
-        r"C:\Program Files\Python311\python.exe",
-        r"C:\Program Files\Python310\python.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python312\python.exe"),
-        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python311\python.exe"),
-    ]
-    for _cand in _candidates:
-        if os.path.isfile(_cand) and os.path.abspath(_cand).lower() != os.path.abspath(sys.executable).lower():
-            try:
-                _chk = subprocess.run([_cand, "-c", "import torch; exit(0 if torch.cuda.is_available() else 1)"], capture_output=True, timeout=5)
-                if _chk.returncode == 0:
-                    os.environ["_PHOTOREPAIR_CUDA_RESPAWNED"] = "1"
-                    sys.exit(subprocess.call([_cand] + sys.argv))
-            except Exception:
-                pass
-
 DEVICE_OBJ = torch.device(DEVICE) if TORCH_AVAILABLE else None
 print(f"\n{'='*60}")
 if DEVICE == "cuda":
@@ -87,8 +68,16 @@ def _get_lama():
     with _LAMA_LOCK:
         if _LAMA is None:
             try:
-                from simple_lama_inpainting import SimpleLama
-                _LAMA = SimpleLama(device=DEVICE_OBJ)
+                _orig_jit_load = torch.jit.load
+                def _safe_jit_load(p, *args, **kwargs):
+                    kwargs.setdefault("map_location", DEVICE_OBJ)
+                    return _orig_jit_load(p, *args, **kwargs)
+                torch.jit.load = _safe_jit_load
+                try:
+                    from simple_lama_inpainting import SimpleLama
+                    _LAMA = SimpleLama(device=DEVICE_OBJ)
+                finally:
+                    torch.jit.load = _orig_jit_load
                 if hasattr(_LAMA, "model") and hasattr(_LAMA.model, "to"):
                     _LAMA.model.to(DEVICE_OBJ)
                 print(f"[INFO] ✅ LaMa loaded successfully.")
