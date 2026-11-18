@@ -39,7 +39,8 @@ def restore_faces_selective(
     gfpgan,
     det_thr: float = 0.55,
     min_damage: float = 0.02,
-    strength: float = 0.85,
+    strength: float = 0.6,
+    keep_real: float = 0.4,
     max_damage: float = 0.80,
     logger=None,
 ) -> tuple[np.ndarray, list[dict]]:
@@ -124,12 +125,12 @@ def restore_faces_selective(
         if logger: logger(f"[GFPGAN] errore paste-back: {e}")
         return rgb_out, face_info
 
-    if strength < 1.0:
-        out = np.clip(
-            rgb_out.astype(np.float32) * (1.0 - strength) + restored_rgb.astype(np.float32) * strength,
-            0, 255
-        ).astype(np.uint8)
-    else:
-        out = restored_rgb
+    total_w = keep_real + strength
+    w_orig = keep_real / total_w if total_w > 0 else 0.4
+    w_rest = strength / total_w if total_w > 0 else 0.6
+    out = np.clip(
+        rgb_out.astype(np.float32) * w_orig + restored_rgb.astype(np.float32) * w_rest,
+        0, 255
+    ).astype(np.uint8)
 
     return out, face_info

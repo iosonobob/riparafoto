@@ -738,6 +738,16 @@ def _find_visual_glitches_safe(a: np.ndarray, force: bool = False) -> np.ndarray
     dilated = cv2.dilate(filtered, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)))
     return dilated
 
+def mask_thin_row_glitches(rgb: np.ndarray, thr: int = 28, min_len: int = 40) -> np.ndarray:
+    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    up, down = np.roll(g, 1, axis=0), np.roll(g, -1, axis=0)
+    dev = np.minimum(np.abs(g - up), np.abs(g - down))   # differisce da ENTRAMBI i vicini
+    cand = (dev > thr).astype(np.uint8)
+    # tiene solo righe corte in altezza ma lunghe in larghezza (le strisce)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (min_len, 1))
+    line = cv2.morphologyEx(cand, cv2.MORPH_OPEN, k)
+    return cv2.dilate(line * 255, np.ones((5, 5), np.uint8))
+
 def mask_from_lost(w, h, params, bad, ri, mx):
     hmax, vmax = params["hmax"], params["vmax"]
     mcu_w, mcu_h = 8 * hmax, 8 * vmax
@@ -841,6 +851,8 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
     if visual:
         vis_mask = _find_visual_glitches_safe(rgb, force=force)
         mask_combined = np.maximum(mask_combined, vis_mask)
+        glitch = mask_thin_row_glitches(rgb)
+        mask_combined = np.maximum(mask_combined, glitch)
 
     if mask_combined.max() == 0:
         return None
@@ -880,7 +892,8 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
             rgb_out, mask_combined, gfpgan,
             det_thr=0.55,      # il default 0.97 è troppo severo per volti rovinati
             min_damage=0.02,   # tocca solo i volti che intersecano il danno
-            strength=0.85,
+            strength=0.6,
+            keep_real=0.4,
         )
         res = Image.fromarray(rgb_out)
         engine += " + GFPGAN(selettivo)"
