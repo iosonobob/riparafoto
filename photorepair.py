@@ -881,33 +881,55 @@ def mask_row_bands(rgb: np.ndarray, thr: int = 12, min_frac: float = 0.10,
     while y < h:
         if not core[y]:
             y += 1; continue
+        # isteresi limitata: max 4 righe di crescita per lato
         y1 = y
-        while y1 > 0 and edge[y1 - 1]: y1 -= 1          # isteresi: bordi faint
+        while y1 > 0 and edge[y1 - 1] and y - y1 < 4: y1 -= 1
         y2 = y
         while y2 + 1 < h and core[y2 + 1]: y2 += 1
-        while y2 + 1 < h and edge[y2 + 1]: y2 += 1
+        while y2 + 1 < h and edge[y2 + 1] and y2 - y < 4: y2 += 1
+        band = cand[y1:y2 + 1].copy()
         if y2 - y1 + 1 <= max_band:
-            band = cand[y1:y2 + 1].copy()
-            for r in range(band.shape[0]):              # fill primo->ultimo px
+            # fill primo->ultimo px solo per bande sottili
+            for r in range(band.shape[0]):
                 xs = np.flatnonzero(band[r])
                 if xs.size: band[r, xs[0]:xs[-1] + 1] = 1
-            mask[y1:y2 + 1] = band * 255
+        # bande alte: maschera i cand, non le scarta
+        mask[y1:y2 + 1] = band * 255
         y = y2 + 1
     mask[:20] = 0; mask[-20:] = 0
     return cv2.dilate(mask, np.ones((9, 9), np.uint8))
 
-def mask_chroma_spots(rgb: np.ndarray, thr: int = 28, max_area: int = 400) -> np.ndarray:
+def mask_chroma_spots(rgb: np.ndarray, thr: int = 45, sat_min: int = 150,
+                      max_area: int = 60, max_total: float = 0.0005) -> np.ndarray:
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     med = cv2.medianBlur(lab, 9)
     dev = np.abs(lab.astype(np.int16) - med.astype(np.int16)).max(2)
     sat = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)[:, :, 1]
-    cand = ((dev > thr) & (sat > 60)).astype(np.uint8) * 255
+    cand = ((dev > thr) & (sat > sat_min)).astype(np.uint8) * 255
     n, cc, stats, _ = cv2.connectedComponentsWithStats(cand, 8)
-    out = np.zeros_like(cand)
+    out = np.zeros_like(cand); tot = 0
     for i in range(1, n):
-        if stats[i, cv2.CC_STAT_AREA] <= max_area:
-            out[cc == i] = 255
-    return cv2.dilate(out, np.ones((5, 5), np.uint8))
+        a = stats[i, cv2.CC_STAT_AREA]
+        if a <= max_area:
+            out[cc == i] = 255; tot += a
+    if tot > max_total * rgb.shape[0] * rgb.shape[1]:
+        return np.zeros_like(cand)   # troppi "spots" = texture reale: skip
+    return cv2.dilate(out, np.ones((3, 3), np.uint8))
+
+def neon_score(rgb: np.ndarray) -> int:
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    return int(((hsv[:, :, 1] > 190) & (hsv[:, :, 2] > 190)).sum())
+
+def _guarded(fn_rgb, name: str, log: list, threshold: float = 1.05, margin: int = 200) -> np.ndarray:
+    rgb_in, fn = fn_rgb
+    before = neon_score(rgb_in)
+    rgb_out = fn(rgb_in)
+    after = neon_score(rgb_out)
+    if after > before * threshold + margin:
+        log.append(f"{name}: SCARTATO (neon {before} -> {after})")
+        return rgb_in
+    log.append(f"{name}: neon {before} -> {after}")
+    return rgb_out
 
 def mask_thin_row_glitches(rgb: np.ndarray, thr: int = 14, min_len: int = 40) -> np.ndarray:
     return mask_row_bands(rgb, thr=thr)
@@ -1052,8 +1074,8 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
     
     if lama is not None:
         try:
-            rep(0.40, "running LaMa hybrid inpainting at native resolution...")
-            inpainted_np = lama_inpaint_hybrid(lama, rgb, mask_combined)
+            rep(0.40, "running LaMa tiled inpainting at native resolution...")
+            inpainted_np = lama_inpaint_tiled(lama, rgb, mask_combined)
             inpainted_img = Image.fromarray(inpainted_np)
             mask_base = np.maximum(structural_mask if structural_mask is not None else 0, vis_mask if vis_mask is not None else 0)
             if mask_base.any():
@@ -1063,15 +1085,20 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
             if glitch.any():
                 res = blend_masked(res, inpainted_img, glitch, feather=3)
 
-            # Second pass: re-detect and inpaint residual stripes
+            # Second/third pass: re-detect and inpaint residual stripes (guarded)
             if visual:
                 for pass_idx in range(2):
-                    again = mask_row_bands(np.array(res.convert("RGB")))
+                    rgb_cur = np.array(res.convert("RGB"))
+                    again = mask_row_bands(rgb_cur)
                     if (again > 0).mean() < 0.0005:
                         break
                     error_log.append(f"pass {pass_idx+2} righe residue: {int((again > 0).sum())} pixel")
-                    inpainted_again = lama_inpaint_tiled(lama, np.array(res.convert("RGB")), again)
-                    res = blend_masked(res, Image.fromarray(inpainted_again), again, feather=3)
+                    def _do_pass(r, _again=again, _lama=lama):
+                        return np.array(blend_masked(Image.fromarray(r),
+                                        Image.fromarray(lama_inpaint_tiled(_lama, r, _again)),
+                                        _again, feather=3).convert("RGB"))
+                    rgb_cur = _guarded((rgb_cur, _do_pass), f"pass{pass_idx+2}", error_log)
+                    res = Image.fromarray(rgb_cur)
 
             engine = f"LaMa (GPU {DEVICE.upper()})"
         except Exception as e:
@@ -1099,10 +1126,10 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
         rgb_out = np.array(res.convert("RGB"))
         rgb_out, face_info = restore_faces_selective(
             rgb_out, mask_combined, gfpgan,
-            det_thr=0.35,      # cattura volti fortemente danneggiati o ruotati
+            det_thr=0.35,
             min_damage=0.01,
-            strength=0.9,      # 90% AI per cancellare le righe
-            keep_real=0.1,     # 10% reale per evitare ghost stripes
+            strength=0.7,      # D: 0.7/0.3 compromesso credibile senza effetto cerato
+            keep_real=0.3,
             logger=error_log.append,
         )
         res = Image.fromarray(rgb_out)
@@ -1112,14 +1139,25 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
 
     if visual:
         rgb_out = np.array(res.convert("RGB"))
-        bands = mask_row_bands(rgb_out)
-        if bands.any():
-            rgb_out = (lama_inpaint_tiled(lama, rgb_out, bands, 768, 192)
-                       if lama is not None else cv2.inpaint(rgb_out, bands, 3, cv2.INPAINT_TELEA))
+
+        # Cleanup finale: bande residue (guarded)
+        def _do_bands(r):
+            bands = mask_row_bands(r)
+            if not bands.any(): return r
+            inpainted = (lama_inpaint_tiled(lama, r, bands, 768, 192)
+                         if lama is not None else cv2.inpaint(r, bands, 3, cv2.INPAINT_TELEA))
+            return np.array(blend_masked(Image.fromarray(r), Image.fromarray(inpainted), bands, feather=3).convert("RGB"))
+        rgb_out = _guarded((rgb_out, _do_bands), "cleanup-bande", error_log)
+
+        # Cleanup finale: spots neon isolati (con budget totale)
         spots = mask_chroma_spots(rgb_out)
         if spots.any():
-            rgb_out = cv2.inpaint(rgb_out, spots, 3, cv2.INPAINT_TELEA)
-        error_log.append(f"cleanup finale: righe {int((bands>0).sum())} px, spots {int((spots>0).sum())} px")
+            def _do_spots(r, _s=spots): return cv2.inpaint(r, _s, 3, cv2.INPAINT_TELEA)
+            rgb_out = _guarded((rgb_out, _do_spots), "cleanup-spots", error_log)
+            error_log.append(f"cleanup finale: spots {int((spots>0).sum())} px")
+        else:
+            error_log.append("cleanup finale: spots 0 px (skip)")
+
         res = Image.fromarray(rgb_out)
     
     if alpha is not None: res.putalpha(alpha)
