@@ -653,7 +653,7 @@ def _cut_bits(buf: bytes, end_bit: int) -> bytes:
     if rem == 0: return buf[:nbytes]
     return buf[:nbytes] + bytes([buf[nbytes] | (0xFF >> rem)])
 
-def repair_baseline_v2(data: bytes, segs, params, results, margin: int = 4):
+def repair_baseline_v2(data: bytes, segs, params, results, margin: int = 8):
     ecs_i = next(i for i, s in enumerate(segs) if s.marker is None)
     out = bytearray(b"\xff\xd8")
     for s in segs[:ecs_i]: out += data[s.start:s.end]
@@ -688,7 +688,7 @@ def repair_baseline_v2(data: bytes, segs, params, results, margin: int = 4):
     out += b"\xff\xd9"
     return bytes(out), kept / params["mcus"], bad
 
-def repair_baseline(data: bytes, segs, params, results, margin: int = 4):
+def repair_baseline(data: bytes, segs, params, results, margin: int = 8):
     return repair_baseline_v2(data, segs, params, results, margin)
 
 # --------------------------------------------------------------------------- B) Pixel Reconstruction & Inpainting
@@ -705,48 +705,61 @@ def _find_visual_glitches_safe(a: np.ndarray, force: bool = False) -> np.ndarray
     variance = np.maximum(0, sq_blur - blur**2)
 
     # 1. Indicator colors typical of decoder fills or stream corruption
-    # Mid-gray 128 (standard libjpeg fill for truncated stream)
     is_gray = (np.abs(a[:, :, 0].astype(int) - 128) < 10) & \
               (np.abs(a[:, :, 1].astype(int) - 128) < 10) & \
               (np.abs(a[:, :, 2].astype(int) - 128) < 10)
-    # Deep black fill
     is_black = (a[:, :, 0] < 6) & (a[:, :, 1] < 6) & (a[:, :, 2] < 6)
-    # Unnatural saturated neon spikes (DCT bitstream desync)
-    is_neon = (hsv[:, :, 1] > 220) & (hsv[:, :, 2] > 220)
+    is_neon = (hsv[:, :, 1] > 170) & (hsv[:, :, 2] > 170)
 
-    suspicious_color = is_gray | is_black | is_neon
+    # Defect: flat fills OR noisy saturated desync spikes
+    damage = (((is_gray | is_black) & (variance < 5.0)) | (is_neon & (variance < 80.0))).astype(np.uint8) * 255
     if force:
         is_white = (a[:, :, 0] > 248) & (a[:, :, 1] > 248) & (a[:, :, 2] > 248)
-        suspicious_color = suspicious_color | is_white
+        damage = np.maximum(damage, (is_white & (variance < 10.0)).astype(np.uint8) * 255)
 
-    # Defect: suspicious color combined with flat variance
-    damage = (suspicious_color & (variance < 5.0)).astype(np.uint8) * 255
-
-    # 2. Morphological cleanup to remove small noise
-    damage = cv2.morphologyEx(damage, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    # 2. Morphological cleanup: 3x3 kernel preserves thin structures
+    damage = cv2.morphologyEx(damage, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(damage, connectivity=8)
     filtered = np.zeros_like(damage)
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         bw = stats[i, cv2.CC_STAT_WIDTH]
         bh = stats[i, cv2.CC_STAT_HEIGHT]
-        if area > 100 or (max(bw, bh) > 30 and min(bw, bh) <= 8):
+        if area > 40 or (max(bw, bh) > 30 and min(bw, bh) <= 8):
             filtered[labels == i] = 255
 
     # 3. Generous dilation (19x19 ellipse, ~9px radius)
-    # Fully swallows DCT ringing, edge blur, and boundary transition zones
     dilated = cv2.dilate(filtered, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)))
     return dilated
 
-def mask_thin_row_glitches(rgb: np.ndarray, thr: int = 28, min_len: int = 40) -> np.ndarray:
-    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    up, down = np.roll(g, 1, axis=0), np.roll(g, -1, axis=0)
-    dev = np.minimum(np.abs(g - up), np.abs(g - down))   # differisce da ENTRAMBI i vicini
+def mask_row_bands(rgb: np.ndarray, thr: int = 14, min_frac: float = 0.12,
+                   max_band: int = 40, join: int = 31) -> np.ndarray:
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.int16)
+    h, w = lab.shape[:2]
+    sh = (3, 6, 9, 12, 15, 18)
+    up = np.median(np.stack([np.roll(lab, s, 0) for s in sh]), 0)
+    dn = np.median(np.stack([np.roll(lab, -s, 0) for s in sh]), 0)
+    dev = np.minimum(np.abs(lab - up).max(2), np.abs(lab - dn).max(2))
     cand = (dev > thr).astype(np.uint8)
-    # tiene solo righe corte in altezza ma lunghe in larghezza (le strisce)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (min_len, 1))
-    line = cv2.morphologyEx(cand, cv2.MORPH_OPEN, k)
-    return cv2.dilate(line * 255, np.ones((5, 5), np.uint8))
+    rows = cand.mean(1) > min_frac
+    mask = np.zeros((h, w), np.uint8)
+    y = 0
+    while y < h:
+        if not rows[y]:
+            y += 1; continue
+        y2 = y
+        while y2 + 1 < h and rows[y2 + 1]:
+            y2 += 1
+        if y2 - y + 1 <= max_band:
+            band = cv2.morphologyEx(cand[y:y2 + 1], cv2.MORPH_CLOSE,
+                                    np.ones((1, join), np.uint8))
+            mask[y:y2 + 1] = band * 255
+        y = y2 + 1
+    mask[:20] = 0; mask[-20:] = 0
+    return cv2.dilate(mask, np.ones((5, 5), np.uint8))
+
+def mask_thin_row_glitches(rgb: np.ndarray, thr: int = 14, min_len: int = 40) -> np.ndarray:
+    return mask_row_bands(rgb, thr=thr)
 
 def mask_from_lost(w, h, params, bad, ri, mx):
     hmax, vmax = params["hmax"], params["vmax"]
@@ -758,7 +771,7 @@ def mask_from_lost(w, h, params, bad, ri, mx):
             r, c = idx // mx, idx % mx
             y1, x1 = r * mcu_h, c * mcu_w
             mask[y1:min(h, y1 + mcu_h), x1:min(w, x1 + mcu_w)] = 255
-    return cv2.dilate(mask, np.ones((5, 5), np.uint8))
+    return cv2.dilate(mask, np.ones((9, 9), np.uint8))
 
 def _structural_mask_from_intervals(im: Image.Image, bad, params: dict) -> np.ndarray:
     if not bad: return np.zeros((im.size[1], im.size[0]), dtype=np.uint8)
@@ -828,6 +841,7 @@ def blend_masked(orig: Image.Image, new: Image.Image, mask_np: np.ndarray, feath
     """Seamlessly blends new content over the original, preserving unmasked healthy pixels."""
     k = feather if feather % 2 == 1 else feather + 1
     m = cv2.GaussianBlur(mask_np.astype(np.float32) / 255.0, (k, k), 0)[..., None]
+    m = np.maximum(m, (mask_np > 0).astype(np.float32)[..., None])
     o = np.asarray(orig.convert("RGB"), np.float32)
     n = np.asarray(new.convert("RGB").resize(orig.size, Image.LANCZOS), np.float32)
     res = o * (1.0 - m) + n * m
@@ -854,7 +868,7 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
         mask_combined = np.maximum(mask_combined, vis_mask)
 
     error_log = []
-    glitch = mask_thin_row_glitches(rgb) if visual else np.zeros((h, w), dtype=np.uint8)
+    glitch = mask_row_bands(rgb) if visual else np.zeros((h, w), dtype=np.uint8)
     if glitch.any():
         mask_combined = np.maximum(mask_combined, glitch)
         error_log.append(f"maschera righe: {int((glitch > 0).sum())} pixel")
@@ -882,6 +896,17 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
                 res = im
             if glitch.any():
                 res = blend_masked(res, inpainted_img, glitch, feather=3)
+
+            # Second pass: re-detect and inpaint residual stripes
+            if visual:
+                for pass_idx in range(2):
+                    again = mask_row_bands(np.array(res.convert("RGB")))
+                    if (again > 0).mean() < 0.0005:
+                        break
+                    error_log.append(f"pass {pass_idx+2} righe residue: {int((again > 0).sum())} pixel")
+                    inpainted_again = lama_inpaint_tiled(lama, np.array(res.convert("RGB")), again)
+                    res = blend_masked(res, Image.fromarray(inpainted_again), again, feather=3)
+
             engine = f"LaMa (GPU {DEVICE.upper()})"
         except Exception as e:
             error_log.append(f"LaMa failed: {e}")
@@ -908,10 +933,11 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
         rgb_out = np.array(res.convert("RGB"))
         rgb_out, face_info = restore_faces_selective(
             rgb_out, mask_combined, gfpgan,
-            det_thr=0.55,      # il default 0.97 è troppo severo per volti rovinati
-            min_damage=0.02,   # tocca solo i volti che intersecano il danno
-            strength=0.6,
-            keep_real=0.4,
+            det_thr=0.35,      # cattura volti fortemente danneggiati o ruotati
+            min_damage=0.01,
+            strength=0.9,      # 90% AI per cancellare le righe
+            keep_real=0.1,     # 10% reale per evitare ghost stripes
+            logger=error_log.append,
         )
         res = Image.fromarray(rgb_out)
         engine += " + GFPGAN(selettivo)"
@@ -1025,6 +1051,16 @@ def process(path: Path, outdir: Path, opts: Options | None = None, report=None) 
         if rec is not None:
             res, share, engine, mask_combined, error_log = rec
             details.extend(error_log)
+
+            # Debug: save damage mask and 50% red overlay for visual validation
+            try:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(out.with_name(out.stem + "_mask.png")), mask_combined)
+                ov = np.array(image.convert("RGB")).copy()
+                ov[mask_combined > 0] = (ov[mask_combined > 0] * 0.5 + np.array([255, 0, 0]) * 0.5).astype(np.uint8)
+                cv2.imwrite(str(out.with_name(out.stem + "_overlay.jpg")), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
+            except Exception as e:
+                details.append(f"overlay save failed: {e}")
             
             for key in ("exif", "icc_profile"):
                 if image.info.get(key): res.info[key] = image.info[key]

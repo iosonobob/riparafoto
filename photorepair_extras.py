@@ -37,10 +37,10 @@ def restore_faces_selective(
     rgb_out: np.ndarray,
     mask: np.ndarray,
     gfpgan,
-    det_thr: float = 0.55,
-    min_damage: float = 0.02,
-    strength: float = 0.6,
-    keep_real: float = 0.4,
+    det_thr: float = 0.35,
+    min_damage: float = 0.01,
+    strength: float = 0.9,
+    keep_real: float = 0.1,
     max_damage: float = 0.80,
     logger=None,
 ) -> tuple[np.ndarray, list[dict]]:
@@ -65,6 +65,9 @@ def restore_faces_selective(
         if logger: logger(f"[GFPGAN] errore estrazione landmark: {e}")
         return rgb_out, []
 
+    scores = [round(float(b[4]), 2) for b in face_helper.det_faces] if face_helper.det_faces else []
+    if logger: logger(f"GFPGAN: {len(face_helper.det_faces)} volti rilevati (scores: {scores})")
+
     if len(face_helper.det_faces) == 0:
         return rgb_out, []
 
@@ -88,7 +91,7 @@ def restore_faces_selective(
             azione = "ripristinato"
             needs_restore = True
 
-        face_info.append({"box": box, "azione": azione, "damage": dmg_ratio})
+        face_info.append({"box": box, "azione": azione, "damage": round(dmg_ratio, 3)})
 
     if not needs_restore:
         return rgb_out, face_info
@@ -125,11 +128,22 @@ def restore_faces_selective(
         if logger: logger(f"[GFPGAN] errore paste-back: {e}")
         return rgb_out, face_info
 
+    # Blend specifically only inside restored face boxes to avoid altering healthy faces
+    restored_mask = np.zeros((h, w), dtype=np.float32)
+    for f in face_info:
+        if f["azione"] == "ripristinato":
+            x1, y1, x2, y2 = f["box"]
+            bx1, by1 = max(0, x1), max(0, y1)
+            bx2, by2 = min(w, x2), min(h, y2)
+            restored_mask[by1:by2, bx1:bx2] = 1.0
+
+    restored_mask = cv2.GaussianBlur(restored_mask, (21, 21), 0)[..., None]
     total_w = keep_real + strength
-    w_orig = keep_real / total_w if total_w > 0 else 0.4
-    w_rest = strength / total_w if total_w > 0 else 0.6
+    w_orig = keep_real / total_w if total_w > 0 else 0.1
+    w_rest = strength / total_w if total_w > 0 else 0.9
+    restored_blend = rgb_out.astype(np.float32) * w_orig + restored_rgb.astype(np.float32) * w_rest
     out = np.clip(
-        rgb_out.astype(np.float32) * w_orig + restored_rgb.astype(np.float32) * w_rest,
+        rgb_out.astype(np.float32) * (1.0 - restored_mask) + restored_blend * restored_mask,
         0, 255
     ).astype(np.uint8)
 
