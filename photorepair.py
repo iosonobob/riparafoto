@@ -848,18 +848,22 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
     if structural_mask is not None:
         mask_combined = np.maximum(mask_combined, structural_mask)
         
+    vis_mask = None
     if visual:
         vis_mask = _find_visual_glitches_safe(rgb, force=force)
         mask_combined = np.maximum(mask_combined, vis_mask)
-        glitch = mask_thin_row_glitches(rgb)
+
+    error_log = []
+    glitch = mask_thin_row_glitches(rgb) if visual else np.zeros((h, w), dtype=np.uint8)
+    if glitch.any():
         mask_combined = np.maximum(mask_combined, glitch)
+        error_log.append(f"maschera righe: {int((glitch > 0).sum())} pixel")
 
     if mask_combined.max() == 0:
         return None
 
     total_hole_ratio = np.count_nonzero(mask_combined) / mask_combined.size
     
-    error_log = []
     engine = "OpenCV"
     res = None
 
@@ -870,7 +874,14 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
         try:
             rep(0.40, "running LaMa tiled inpainting at native resolution...")
             inpainted_np = lama_inpaint_tiled(lama, rgb, mask_combined)
-            res = blend_masked(im, Image.fromarray(inpainted_np), mask_combined, feather=15)
+            inpainted_img = Image.fromarray(inpainted_np)
+            mask_base = np.maximum(structural_mask if structural_mask is not None else 0, vis_mask if vis_mask is not None else 0)
+            if mask_base.any():
+                res = blend_masked(im, inpainted_img, mask_base, feather=15)
+            else:
+                res = im
+            if glitch.any():
+                res = blend_masked(res, inpainted_img, glitch, feather=3)
             engine = f"LaMa (GPU {DEVICE.upper()})"
         except Exception as e:
             error_log.append(f"LaMa failed: {e}")
@@ -879,7 +890,14 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
     if res is None:
         rep(0.60, "OpenCV inpainting fallback...")
         repaired = cv2.inpaint(rgb, mask_combined, 5, cv2.INPAINT_TELEA)
-        res = blend_masked(im, Image.fromarray(repaired), mask_combined, feather=11)
+        repaired_img = Image.fromarray(repaired)
+        mask_base = np.maximum(structural_mask if structural_mask is not None else 0, vis_mask if vis_mask is not None else 0)
+        if mask_base.any():
+            res = blend_masked(im, repaired_img, mask_base, feather=11)
+        else:
+            res = im
+        if glitch.any():
+            res = blend_masked(res, repaired_img, glitch, feather=3)
         engine = "OpenCV (fallback)"
 
     # Face restoration with GFPGAN (selectively applied only to faces intersecting damaged regions)
