@@ -40,6 +40,7 @@ except ImportError:
     cv2 = np = None
 
 # --- GPU & AI ACCELERATION ---
+DEBUG = bool(os.environ.get("PHOTOREPAIR_DEBUG"))
 TORCH_AVAILABLE = False
 try:
     import torch
@@ -504,6 +505,106 @@ def _build_lookup(bits, vals):
         code <<= 1
     return table
 
+def _enc_tables(dht):
+    enc = {}
+    for key, (bits, vals) in dht.items():
+        code, k, t = 0, 0, {}
+        for ln in range(1, 17):
+            for _ in range(bits[ln - 1]):
+                t[vals[k]] = (code, ln); code += 1; k += 1
+            code <<= 1
+        enc[key] = t
+    return enc
+
+class _BitW:
+    def __init__(self): self.buf = bytearray(); self.acc = 0; self.n = 0
+    def put(self, val, n):
+        self.acc = (self.acc << n) | (val & ((1 << n) - 1)); self.n += n
+        while self.n >= 8:
+            self.n -= 8; b = (self.acc >> self.n) & 0xFF
+            self.buf.append(b)
+            if b == 0xFF: self.buf.append(0)
+    def flush(self):
+        if self.n: self.put((1 << (8 - self.n)) - 1, 8 - self.n)
+        return bytes(self.buf)
+
+def _encode_interval(mcus, blocks, enc, dc_shift=None):
+    bw = _BitW()
+    for mi, mcu in enumerate(mcus):
+        for (ci, diff, ac, eob), (_d, _a, _c, _q, _l, td, ta) in zip(mcu, blocks):
+            if mi == 0 and dc_shift is not None and ci < len(dc_shift):
+                diff += dc_shift[ci]
+            s = abs(diff).bit_length()
+            if s > 11: return None
+            if (0, td) not in enc or s not in enc[(0, td)]: return None
+            c, ln = enc[(0, td)][s]; bw.put(c, ln)
+            if s: bw.put(diff if diff > 0 else diff + (1 << s) - 1, s)
+            for r, s2, val in ac:
+                sym = (r << 4) | s2
+                if (1, ta) not in enc or sym not in enc[(1, ta)]: return None
+                c, ln = enc[(1, ta)][sym]; bw.put(c, ln)
+                if s2: bw.put(val if val > 0 else val + (1 << s2) - 1, s2)
+            if eob:
+                if (1, ta) not in enc or 0 not in enc[(1, ta)]: return None
+                c, ln = enc[(1, ta)][0]; bw.put(c, ln)
+    return bw.flush()
+
+def _decode_coeffs(buf: bytes, n_mcus: int, blocks):
+    nbits = len(buf) * 8
+    padded = buf + bytes(3)
+    words = [(padded[i] << 16) | (padded[i + 1] << 8) | padded[i + 2] for i in range(len(buf) + 1)]
+    words.extend([0] * 300)
+    pos, pred = 0, [0, 0, 0]
+    mcus = []
+    for m in range(n_mcus):
+        mcu_data = []
+        for b in blocks:
+            dct, act, ci, q, lim = b[:5]
+            v = dct[(words[pos >> 3] >> (8 - (pos & 7))) & 0xFFFF]
+            if not v: return mcus, "invalid Huffman code"
+            pos += v >> 8
+            s = v & 255
+            if s > 11: return mcus, "invalid DC category"
+            diff = 0
+            if s:
+                bits = (words[pos >> 3] >> (24 - (pos & 7) - s)) & ((1 << s) - 1)
+                pos += s
+                if bits < (1 << (s - 1)): bits -= (1 << s) - 1
+                diff = bits
+                pred[ci] += bits
+                if not -lim <= pred[ci] <= lim: return mcus, "DC value out of bounds"
+            k = 1
+            ac = []
+            eob = False
+            while k < 64:
+                v = act[(words[pos >> 3] >> (8 - (pos & 7))) & 0xFFFF]
+                if not v: return mcus, "invalid Huffman code"
+                pos += v >> 8
+                rs = v & 255
+                s2 = rs & 15
+                if s2:
+                    r = rs >> 4
+                    k += r
+                    if k > 63 or s2 > 10: return mcus, "misplaced AC coefficient"
+                    bits2 = (words[pos >> 3] >> (24 - (pos & 7) - s2)) & ((1 << s2) - 1)
+                    pos += s2
+                    if bits2 < (1 << (s2 - 1)): bits2 -= (1 << s2) - 1
+                    if (1 << (s2 - 1)) * q[k] > 2600: return mcus, "implausible AC coefficient"
+                    ac.append((r, s2, bits2))
+                    k += 1
+                elif rs == 0xF0:
+                    k += 16
+                    ac.append((15, 0, 0))
+                elif rs == 0:
+                    eob = True
+                    break
+                else:
+                    return mcus, "invalid AC symbol"
+            if pos > nbits: return mcus, "insufficient data"
+            mcu_data.append((ci, diff, ac, eob))
+        mcus.append(mcu_data)
+    return mcus, None
+
 def baseline_params(data: bytes, segs):
     sof = sos = None
     dht, qt, dri = {}, {}, 0
@@ -545,7 +646,8 @@ def baseline_params(data: bytes, segs):
         dct, act = luts.get((0, tdta >> 4)), luts.get((1, tdta & 15))
         if dct is None or act is None: return None
         q = qt.get(comps[cid][2]) or [1] * 64
-        blocks += [(dct, act, ci, q, 1024 // max(q[0], 1) + 2)] * (comps[cid][0] * comps[cid][1] if ns > 1 else 1)
+        td, ta = tdta >> 4, tdta & 15
+        blocks += [(dct, act, ci, q, 1024 // max(q[0], 1) + 2, td, ta)] * (comps[cid][0] * comps[cid][1] if ns > 1 else 1)
     
     hmax = max(c[0] for c in comps.values())
     vmax = max(c[1] for c in comps.values())
@@ -554,7 +656,7 @@ def baseline_params(data: bytes, segs):
         my = -(-h // (8 * vmax))
     else:
         mx, my = -(-w // 8), -(-h // 8)
-    return {"mcus": mx * my, "blocks": blocks, "ri": dri, "w": w, "h": h, "nc": nc, "mx": mx, "my": my, "hmax": hmax, "vmax": vmax}
+    return {"mcus": mx * my, "blocks": blocks, "ri": dri, "w": w, "h": h, "nc": nc, "mx": mx, "my": my, "hmax": hmax, "vmax": vmax, "dht": dht, "enc": _enc_tables(dht)}
 
 def _decode_interval(buf: bytes, n_mcus: int, blocks, dc_jump_luma: int = 700, dc_jump_chroma: int = 350):
     nbits = len(buf) * 8
@@ -567,7 +669,8 @@ def _decode_interval(buf: bytes, n_mcus: int, blocks, dc_jump_luma: int = 700, d
     for m in range(n_mcus):
         starts.append(pos)
         prev_pred = tuple(pred)
-        for dct, act, ci, q, lim in blocks:
+        for b in blocks:
+            dct, act, ci, q, lim = b[:5]
             v = dct[(words[pos >> 3] >> (8 - (pos & 7))) & 0xFFFF]
             if not v: return m, starts, "invalid Huffman code", pos, first_dc, tuple(pred)
             pos += v >> 8
@@ -623,7 +726,7 @@ def _split_intervals(raw: bytes):
     parts[k] = raw[start:]
     return parts, merged
 
-def check_baseline(data: bytes, segs, params, report=None):
+def check_baseline(data: bytes, segs, params, report=None, strict: bool = False):
     ecs = next(s for s in segs if s.marker is None)
     ri, total = params["ri"], params["mcus"]
     raw = data[ecs.start:ecs.end]
@@ -632,18 +735,21 @@ def check_baseline(data: bytes, segs, params, report=None):
 
     def mcus_in(k): return (ri if k < expected - 1 else total - ri * (expected - 1)) if ri else total
 
+    dc_luma = 400 if strict else 700
+    dc_chroma = 200 if strict else 350
+
     results, carry = [], None
     for k in range(expected):
         n_mcu = mcus_in(k)
         if carry is not None: buf, carry = carry, None
         else: buf = parts.get(k, b"").replace(b"\xff\x00", b"\xff")
-        res = _decode_interval(buf, n_mcu, params["blocks"])
+        res = _decode_interval(buf, n_mcu, params["blocks"], dc_jump_luma=dc_luma, dc_jump_chroma=dc_chroma)
         if k in merged and k + 1 < expected and res[2] in (None, "excess data"):
             cut = (res[3] + 7) // 8
             rest = buf[cut:]
-            scored = [(_decode_interval(rest[skip:], mcus_in(k + 1), params["blocks"])[0], rest[skip:]) for skip in (2, 0, 1)]
+            scored = [(_decode_interval(rest[skip:], mcus_in(k + 1), params["blocks"], dc_jump_luma=dc_luma, dc_jump_chroma=dc_chroma)[0], rest[skip:]) for skip in (2, 0, 1)]
             carry, buf = max(scored, key=lambda t: t[0])[1], buf[:cut]
-            res = _decode_interval(buf, n_mcu, params["blocks"])
+            res = _decode_interval(buf, n_mcu, params["blocks"], dc_jump_luma=dc_luma, dc_jump_chroma=dc_chroma)
         results.append((*res, buf, n_mcu))
         if report and k % 4 == 0: report(k / expected, "verifying image scan data")
     return results
@@ -653,43 +759,70 @@ def _cut_bits(buf: bytes, end_bit: int) -> bytes:
     if rem == 0: return buf[:nbytes]
     return buf[:nbytes] + bytes([buf[nbytes] | (0xFF >> rem)])
 
-def repair_baseline_v2(data: bytes, segs, params, results, margin: int = 8):
+def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
     ecs_i = next(i for i, s in enumerate(segs) if s.marker is None)
     out = bytearray(b"\xff\xd8")
     for s in segs[:ecs_i]: out += data[s.start:s.end]
     kept = 0
     prev_last_dc = None
     bad: list[tuple[int, int, int, int]] = []
+    enc = params.get("enc") or _enc_tables(params.get("dht", {}))
+    blocks = params["blocks"]
     for k, (n_ok, starts, reason, pos, first_dc, last_dc, buf, n_mcu) in enumerate(results):
         if k: out += bytes([0xFF, 0xD0 + (k - 1) % 8])
         dc_incoherent = False
         if reason is not None and prev_last_dc is not None and first_dc is not None and n_ok > 0:
-            for ci in range(3):
+            for ci in range(min(len(prev_last_dc), len(first_dc))):
                 if abs(prev_last_dc[ci] - first_dc[ci]) > 400:
                     dc_incoherent = True
                     break
-        if reason is None:
-            kept += n_mcu
-            piece = buf
-        elif reason == "excess data":
-            kept += n_mcu
-            piece = _cut_bits(buf, pos)
-        elif dc_incoherent:
-            piece = b""
-            bad.append((k, n_mcu, 0, n_mcu))
-        else:
-            keep = max(0, n_ok - margin)
-            kept += keep
-            piece = _cut_bits(buf, starts[keep] if keep < len(starts) else pos)
-            bad.append((k, n_mcu, keep, n_mcu))
+        
+        recoded = None
+        if dc_incoherent and enc:
+            delta = [prev_last_dc[ci] - first_dc[ci] for ci in range(min(len(prev_last_dc), len(first_dc)))]
+            n_target = n_mcu if reason is None else max(0, n_ok - margin)
+            if n_target > 0:
+                coeffs, _ = _decode_coeffs(buf, n_target, blocks)
+                if len(coeffs) == n_target:
+                    recoded = _encode_interval(coeffs, blocks, enc, dc_shift=delta)
+            if recoded is not None:
+                piece = recoded
+                kept += n_target
+                if n_target < n_mcu:
+                    bad.append((k, n_mcu, n_target, n_mcu))
+                if last_dc is not None:
+                    prev_last_dc = tuple(last_dc[ci] + delta[ci] for ci in range(len(delta)))
+        
+        if recoded is None:
+            if reason is None:
+                kept += n_mcu
+                piece = buf
+            elif reason == "excess data":
+                kept += n_mcu
+                piece = _cut_bits(buf, pos)
+            elif dc_incoherent:
+                piece = b""
+                bad.append((k, n_mcu, 0, n_mcu))
+            else:
+                keep = max(0, n_ok - margin)
+                kept += keep
+                piece = _cut_bits(buf, starts[keep] if keep < len(starts) else pos)
+                bad.append((k, n_mcu, keep, n_mcu))
+            
+            if reason is None or not dc_incoherent:
+                prev_last_dc = last_dc
+            else:
+                prev_last_dc = None
+
         out += piece.replace(b"\xff", b"\xff\x00")
-        if reason is None or not dc_incoherent: prev_last_dc = last_dc
-        else: prev_last_dc = None
     out += b"\xff\xd9"
     return bytes(out), kept / params["mcus"], bad
 
-def repair_baseline(data: bytes, segs, params, results, margin: int = 8):
-    return repair_baseline_v2(data, segs, params, results, margin)
+def repair_baseline_v2(data: bytes, segs, params, results, margin: int = 2):
+    return repair_baseline_v3(data, segs, params, results, margin)
+
+def repair_baseline(data: bytes, segs, params, results, margin: int = 2):
+    return repair_baseline_v3(data, segs, params, results, margin)
 
 # --------------------------------------------------------------------------- B) Pixel Reconstruction & Inpainting
 
@@ -732,8 +865,8 @@ def _find_visual_glitches_safe(a: np.ndarray, force: bool = False) -> np.ndarray
     dilated = cv2.dilate(filtered, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)))
     return dilated
 
-def mask_row_bands(rgb: np.ndarray, thr: int = 14, min_frac: float = 0.12,
-                   max_band: int = 40, join: int = 31) -> np.ndarray:
+def mask_row_bands(rgb: np.ndarray, thr: int = 12, min_frac: float = 0.10,
+                   max_band: int = 40, grow: float = 0.03) -> np.ndarray:
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.int16)
     h, w = lab.shape[:2]
     sh = (3, 6, 9, 12, 15, 18)
@@ -741,22 +874,40 @@ def mask_row_bands(rgb: np.ndarray, thr: int = 14, min_frac: float = 0.12,
     dn = np.median(np.stack([np.roll(lab, -s, 0) for s in sh]), 0)
     dev = np.minimum(np.abs(lab - up).max(2), np.abs(lab - dn).max(2))
     cand = (dev > thr).astype(np.uint8)
-    rows = cand.mean(1) > min_frac
+    frac = cand.mean(1)
+    core, edge = frac > min_frac, frac > grow
     mask = np.zeros((h, w), np.uint8)
     y = 0
     while y < h:
-        if not rows[y]:
+        if not core[y]:
             y += 1; continue
+        y1 = y
+        while y1 > 0 and edge[y1 - 1]: y1 -= 1          # isteresi: bordi faint
         y2 = y
-        while y2 + 1 < h and rows[y2 + 1]:
-            y2 += 1
-        if y2 - y + 1 <= max_band:
-            band = cv2.morphologyEx(cand[y:y2 + 1], cv2.MORPH_CLOSE,
-                                    np.ones((1, join), np.uint8))
-            mask[y:y2 + 1] = band * 255
+        while y2 + 1 < h and core[y2 + 1]: y2 += 1
+        while y2 + 1 < h and edge[y2 + 1]: y2 += 1
+        if y2 - y1 + 1 <= max_band:
+            band = cand[y1:y2 + 1].copy()
+            for r in range(band.shape[0]):              # fill primo->ultimo px
+                xs = np.flatnonzero(band[r])
+                if xs.size: band[r, xs[0]:xs[-1] + 1] = 1
+            mask[y1:y2 + 1] = band * 255
         y = y2 + 1
     mask[:20] = 0; mask[-20:] = 0
-    return cv2.dilate(mask, np.ones((5, 5), np.uint8))
+    return cv2.dilate(mask, np.ones((9, 9), np.uint8))
+
+def mask_chroma_spots(rgb: np.ndarray, thr: int = 28, max_area: int = 400) -> np.ndarray:
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    med = cv2.medianBlur(lab, 9)
+    dev = np.abs(lab.astype(np.int16) - med.astype(np.int16)).max(2)
+    sat = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)[:, :, 1]
+    cand = ((dev > thr) & (sat > 60)).astype(np.uint8) * 255
+    n, cc, stats, _ = cv2.connectedComponentsWithStats(cand, 8)
+    out = np.zeros_like(cand)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] <= max_area:
+            out[cc == i] = 255
+    return cv2.dilate(out, np.ones((5, 5), np.uint8))
 
 def mask_thin_row_glitches(rgb: np.ndarray, thr: int = 14, min_len: int = 40) -> np.ndarray:
     return mask_row_bands(rgb, thr=thr)
@@ -835,6 +986,21 @@ def lama_inpaint_tiled(lama, rgb: np.ndarray, mask: np.ndarray, tile_size: int =
     inpainted[has_w] = accum_img[has_w] / accum_weight[has_w, None]
     return np.clip(inpainted, 0, 255).astype(np.uint8)
 
+def lama_inpaint_hybrid(lama, rgb: np.ndarray, mask: np.ndarray, tile: int = 1024, overlap: int = 256, gmax: int = 1536) -> np.ndarray:
+    local = lama_inpaint_tiled(lama, rgb, mask, tile, overlap)
+    if (mask > 0).mean() < 0.12: return local
+    s = gmax / max(rgb.shape[:2])
+    if s >= 1: return local
+    small = cv2.resize(rgb, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    smask = cv2.resize(mask, None, fx=s, fy=s, interpolation=cv2.INTER_NEAREST)
+    g = np.array(lama(Image.fromarray(small), Image.fromarray(smask)))
+    g = cv2.resize(g, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+    lf = cv2.GaussianBlur(g, (0, 0), 24)
+    hf = local.astype(np.float32) - cv2.GaussianBlur(local, (0, 0), 24)
+    out = np.clip(lf + hf, 0, 255).astype(np.uint8)
+    res = local.copy(); m = mask > 0; res[m] = out[m]
+    return res
+
 from photorepair_extras import restore_faces_selective
 
 def blend_masked(orig: Image.Image, new: Image.Image, mask_np: np.ndarray, feather: int = 15) -> Image.Image:
@@ -886,8 +1052,8 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
     
     if lama is not None:
         try:
-            rep(0.40, "running LaMa tiled inpainting at native resolution...")
-            inpainted_np = lama_inpaint_tiled(lama, rgb, mask_combined)
+            rep(0.40, "running LaMa hybrid inpainting at native resolution...")
+            inpainted_np = lama_inpaint_hybrid(lama, rgb, mask_combined)
             inpainted_img = Image.fromarray(inpainted_np)
             mask_base = np.maximum(structural_mask if structural_mask is not None else 0, vis_mask if vis_mask is not None else 0)
             if mask_base.any():
@@ -943,6 +1109,18 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
         engine += " + GFPGAN(selettivo)"
         for f in face_info:
             error_log.append(f"volto {f.get('box')}: {f['azione']}")
+
+    if visual:
+        rgb_out = np.array(res.convert("RGB"))
+        bands = mask_row_bands(rgb_out)
+        if bands.any():
+            rgb_out = (lama_inpaint_tiled(lama, rgb_out, bands, 768, 192)
+                       if lama is not None else cv2.inpaint(rgb_out, bands, 3, cv2.INPAINT_TELEA))
+        spots = mask_chroma_spots(rgb_out)
+        if spots.any():
+            rgb_out = cv2.inpaint(rgb_out, spots, 3, cv2.INPAINT_TELEA)
+        error_log.append(f"cleanup finale: righe {int((bands>0).sum())} px, spots {int((spots>0).sum())} px")
+        res = Image.fromarray(rgb_out)
     
     if alpha is not None: res.putalpha(alpha)
     
@@ -1008,9 +1186,10 @@ def process(path: Path, outdir: Path, opts: Options | None = None, report=None) 
                     if sof in (0xC0, 0xC1):
                         params = baseline_params(data, segs)
                         if params:
-                            results = check_baseline(data, segs, params, lambda f, m: rep(0.05 + 0.15 * f, m))
+                            suspect = jpeg_damaged(data)
+                            results = check_baseline(data, segs, params, lambda f, m: rep(0.05 + 0.15 * f, m), strict=bool(suspect))
                             if any(r[2] for r in results):
-                                data, binary_recovered, bad = repair_baseline_v2(data, segs, params, results)
+                                data, binary_recovered, bad = repair_baseline_v3(data, segs, params, results)
                                 im_temp, _ = decode(data)
                                 if im_temp:
                                     ri = params.get("ri", 0)
@@ -1052,15 +1231,16 @@ def process(path: Path, outdir: Path, opts: Options | None = None, report=None) 
             res, share, engine, mask_combined, error_log = rec
             details.extend(error_log)
 
-            # Debug: save damage mask and 50% red overlay for visual validation
-            try:
-                out.parent.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(out.with_name(out.stem + "_mask.png")), mask_combined)
-                ov = np.array(image.convert("RGB")).copy()
-                ov[mask_combined > 0] = (ov[mask_combined > 0] * 0.5 + np.array([255, 0, 0]) * 0.5).astype(np.uint8)
-                cv2.imwrite(str(out.with_name(out.stem + "_overlay.jpg")), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
-            except Exception as e:
-                details.append(f"overlay save failed: {e}")
+            # Debug: save damage mask and 50% red overlay for visual validation (when PHOTOREPAIR_DEBUG=1)
+            if DEBUG:
+                try:
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(out.with_name(out.stem + "_mask.png")), mask_combined)
+                    ov = np.array(image.convert("RGB")).copy()
+                    ov[mask_combined > 0] = (ov[mask_combined > 0] * 0.5 + np.array([255, 0, 0]) * 0.5).astype(np.uint8)
+                    cv2.imwrite(str(out.with_name(out.stem + "_overlay.jpg")), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
+                except Exception as e:
+                    details.append(f"overlay save failed: {e}")
             
             for key in ("exif", "icc_profile"):
                 if image.info.get(key): res.info[key] = image.info[key]
