@@ -775,19 +775,22 @@ def _ac_energy(mcu):
             e[ci] += sum(abs(v) for _, _, v in ac)
     return e
 
-def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=1024, max_lost=6, probe=6, ref_mcu_above=None):
+def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=4096, max_lost=None, probe=4, ref_mcu_above=None):
     rem = n_mcu - n_ok
+    if rem <= probe: return None, "too_few_remaining"
     best = None
     e_ref = _ac_energy(ref_mcu_above) if ref_mcu_above is not None else None
-    for lost in range(1, min(max_lost, rem - probe) + 1):
+    max_lost_val = min(max_lost if max_lost is not None else rem - probe, rem - probe)
+    for lost in range(0, max_lost_val + 1):
         target = rem - lost
+        thresh = 150.0 + 25.0 * lost + 1.0 * target
         for skip in range(window):
             b2 = _shift_bits(buf, pos + skip)
             if len(b2) < 8: break
             m, _s, _r, _p, fdc, _l = _decode_interval(b2, probe, blocks, 10**6, 10**6)
             if m < probe or fdc is None: continue
             d = [pred_fail[ci] - fdc[ci] for ci in range(min(3, len(pred_fail), len(fdc)))]
-            cost = abs(d[0]) + 0.5 * (abs(d[1]) + abs(d[2])) + 0.25 * skip + 40 * lost
+            cost = abs(d[0]) + 0.5 * (abs(d[1]) + abs(d[2])) + 0.20 * skip + 25.0 * lost
             if e_ref is not None:
                 probe_c, _ = _decode_coeffs(b2, 1, blocks)
                 if probe_c:
@@ -795,9 +798,13 @@ def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=1024, max_
                     if e_new is not None:
                         cost += 0.15 * sum(abs(a - b) for a, b in zip(e_ref, e_new))
             if best is None or cost < best[0]:
-                best = (cost, lost, skip, d, b2, target)
-        if best is not None and best[0] < 120: break
-    return best
+                best = (cost, lost, skip, d, b2, target, thresh)
+        if best is not None and best[0] < thresh: break
+    if best is None:
+        return None, "probe_not_found"
+    if best[0] >= best[6]:
+        return None, "cost_above_threshold"
+    return best[:6], None
 
 def _degrade_ac(mcus_coeffs, idx_start, n_mcu, bad, k):
     for m in range(len(mcus_coeffs)):
@@ -817,6 +824,20 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
     ri = params.get("ri", 0)
     mx = params.get("mx", 1)
     all_mcus = {}
+    resync_stats = {
+        "attempted": 0,
+        "success": 0,
+        "cut": 0,
+        "reasons": {
+            "head_decode_failed": 0,
+            "probe_not_found": 0,
+            "cost_above_threshold": 0,
+            "tail_decode_failed": 0,
+            "encode_failed": 0,
+            "no_enc_or_bounds": 0,
+            "too_few_remaining": 0,
+        }
+    }
 
     for k, (n_ok, starts, reason, pos, first_dc, last_dc, buf, n_mcu) in enumerate(results):
         if k: out += bytes([0xFF, 0xD0 + (k - 1) % 8])
@@ -878,45 +899,63 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
                 keep = max(0, n_ok - margin)
                 sync_done = False
                 if enc and 0 < keep < n_mcu - 1 and len(starts) > keep:
-                    head_coeffs, _ = _decode_coeffs(buf, keep, blocks)
-                    if len(head_coeffs) == keep:
-                        for m_idx, m_c in enumerate(head_coeffs):
-                            all_mcus[idx_base + m_idx] = m_c
-                        # Passo 4: cerca MCU verticalmente adiacente sopra
-                        cand_raster = idx_base + n_ok + 1
-                        ref_above = all_mcus.get(cand_raster - mx) if cand_raster >= mx else None
-                        sync = _resync_interval(buf, n_mcu, n_ok, pos,
-                                                last_dc or (0, 0, 0), blocks, window=1024,
-                                                ref_mcu_above=ref_above)
-                        if sync is not None:
-                            _c, lost, _s, delta_s, b2, target = sync
-                            tail_c, _ = _decode_coeffs(b2, target, blocks)
-                            if len(tail_c) == target:
-                                seen, fixed = set(), []
-                                for (ci2, d2, ac2, eob2) in tail_c[0]:
-                                    if ci2 not in seen: d2 += delta_s[ci2]; seen.add(ci2)
-                                    fixed.append((ci2, d2, ac2, eob2))
-                                tail_c[0] = fixed
-                                ph = [[(bb[2], 0, [], True) for bb in blocks] for _ in range(lost)]
-                                rec = _encode_interval(head_coeffs + ph + tail_c, blocks, enc)
-                                if rec is not None:
-                                    piece = rec.replace(b"\xff\x00", b"\xff")
-                                    kept += keep + target
-                                    bad.append((k, n_mcu, keep, keep + lost))
-                                    p = [0, 0, 0]
-                                    for mr in head_coeffs + ph + tail_c:
-                                        for (ci2, d2, _a, _e) in mr: p[ci2] += d2
-                                    prev_last_dc = tuple(p); sync_done = True
-                                    for m_idx, m_c in enumerate(tail_c):
-                                        all_mcus[idx_base + keep + lost + m_idx] = m_c
+                    resync_stats["attempted"] += 1
+                    head_m, _, head_r, _, _, _ = _decode_interval(buf, keep, blocks)
+                    if head_r is None and head_m == keep:
+                        head_coeffs, _ = _decode_coeffs(buf, keep, blocks)
+                        if len(head_coeffs) == keep:
+                            for m_idx, m_c in enumerate(head_coeffs):
+                                all_mcus[idx_base + m_idx] = m_c
+                            # Passo 4: cerca MCU verticalmente adiacente sopra
+                            cand_raster = idx_base + n_ok + 1
+                            ref_above = all_mcus.get(cand_raster - mx) if cand_raster >= mx else None
+                            sync, fail_reason = _resync_interval(buf, n_mcu, n_ok, pos,
+                                                                 last_dc or (0, 0, 0), blocks, window=4096,
+                                                                 probe=4, ref_mcu_above=ref_above)
+                            if sync is not None:
+                                _c, lost, _s, delta_s, b2, target = sync
+                                tail_c, _ = _decode_coeffs(b2, target, blocks)
+                                if len(tail_c) == target:
+                                    seen, fixed = set(), []
+                                    for (ci2, d2, ac2, eob2) in tail_c[0]:
+                                        if ci2 not in seen: d2 += delta_s[ci2]; seen.add(ci2)
+                                        fixed.append((ci2, d2, ac2, eob2))
+                                    tail_c[0] = fixed
+                                    total_lost = n_mcu - keep - target
+                                    ph = [[(bb[2], 0, [], True) for bb in blocks] for _ in range(total_lost)]
+                                    rec = _encode_interval(head_coeffs + ph + tail_c, blocks, enc)
+                                    if rec is not None:
+                                        piece = rec.replace(b"\xff\x00", b"\xff")
+                                        kept += keep + target
+                                        bad.append((k, n_mcu, keep, keep + total_lost))
+                                        p = [0, 0, 0]
+                                        for mr in head_coeffs + ph + tail_c:
+                                            for (ci2, d2, _a, _e) in mr: p[ci2] += d2
+                                        prev_last_dc = tuple(p); sync_done = True
+                                        resync_stats["success"] += 1
+                                        for m_idx, m_c in enumerate(tail_c):
+                                            all_mcus[idx_base + keep + total_lost + m_idx] = m_c
+                                    else:
+                                        resync_stats["reasons"]["encode_failed"] += 1
+                                else:
+                                    resync_stats["reasons"]["tail_decode_failed"] += 1
+                            else:
+                                if fail_reason in resync_stats["reasons"]:
+                                    resync_stats["reasons"][fail_reason] += 1
+                        else:
+                            resync_stats["reasons"]["head_decode_failed"] += 1
+                    else:
+                        resync_stats["reasons"]["head_decode_failed"] += 1
+                else:
+                    resync_stats["reasons"]["no_enc_or_bounds"] += 1
                 if not sync_done:
+                    resync_stats["cut"] += 1
                     kept += keep
                     piece = _cut_bits(buf, starts[keep] if keep < len(starts) else pos)
                     bad.append((k, n_mcu, keep, n_mcu))
                     prev_last_dc = None if dc_incoherent else last_dc
         out += piece.replace(b"\xff", b"\xff\x00")
-    out += b"\xff\xd9"
-    return bytes(out), kept / params["mcus"], bad
+    params["resync_stats"] = resync_stats
     out += b"\xff\xd9"
     return bytes(out), kept / params["mcus"], bad
 
@@ -1463,7 +1502,12 @@ def process(path: Path, outdir: Path, opts: Options | None = None, report=None) 
                                     ri = params.get("ri", 0)
                                     mx = params["mx"]
                                     structural_mask = mask_from_lost(im_temp.width, im_temp.height, params, bad, ri, mx)
-                                notes.append(f"repaired binary: {binary_recovered:.0%} recovered, {len(bad)} damaged intervals corrected")
+                                rs = params.get("resync_stats")
+                                rs_note = ""
+                                if rs and rs.get("attempted", 0) > 0:
+                                    active_reasons = {k: v for k, v in rs["reasons"].items() if v > 0}
+                                    rs_note = f", resync: {rs['success']}/{rs['attempted']} ok (cut {rs['cut']}, {active_reasons})"
+                                notes.append(f"repaired binary: {binary_recovered:.0%} recovered, {len(bad)} damaged intervals corrected{rs_note}")
         except Exception as e:
             details.append(f"binary check failed: {e}")
 
