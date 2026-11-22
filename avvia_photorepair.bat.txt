@@ -1,0 +1,4 @@
+@echo off
+cd /d "E:\riparafoto antigravity"
+"E:\riparafoto antigravity\venv\Scripts\python.exe" photorepair.py --gui
+pause
