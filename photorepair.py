@@ -821,63 +821,43 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
         
         if recoded is None:
             if reason is None:
-                kept += n_mcu
-                piece = buf
+                kept += n_mcu; piece = buf; prev_last_dc = last_dc
             elif reason == "excess data":
-                kept += n_mcu
-                piece = _cut_bits(buf, pos)
+                kept += n_mcu; piece = _cut_bits(buf, pos); prev_last_dc = last_dc
             elif dc_incoherent:
-                piece = b""
-                bad.append((k, n_mcu, 0, n_mcu))
+                piece = b""; bad.append((k, n_mcu, 0, n_mcu)); prev_last_dc = None
             else:
-                # FIX3 resync: cerca il punto di riaggancio Huffman
                 keep = max(0, n_ok - margin)
                 sync_done = False
-                if enc and keep < n_mcu - 1 and len(starts) > keep:
+                if enc and 0 < keep < n_mcu - 1 and len(starts) > keep:
                     head_coeffs, _ = _decode_coeffs(buf, keep, blocks)
                     if len(head_coeffs) == keep:
-                        sync = _resync_interval(buf, n_mcu, n_ok,
-                                                starts[keep] if keep < len(starts) else pos,
-                                                last_dc or (0, 0, 0), blocks)
+                        sync = _resync_interval(buf, n_mcu, n_ok, pos,
+                                                last_dc or (0, 0, 0), blocks, window=1024)
                         if sync is not None:
-                            _cost, lost, _skip, delta_s, b2, target = sync
-                            tail_c, tail_e = _decode_coeffs(b2, target, blocks)
+                            _c, lost, _s, delta_s, b2, target = sync
+                            tail_c, _ = _decode_coeffs(b2, target, blocks)
                             if len(tail_c) == target:
-                                # applica delta al primo MCU della tail
-                                seen_ci, fixed_first = set(), []
-                                for (ci2, diff2, ac2, eob2) in tail_c[0]:
-                                    if ci2 not in seen_ci:
-                                        diff2 += delta_s[ci2]; seen_ci.add(ci2)
-                                    fixed_first.append((ci2, diff2, ac2, eob2))
-                                tail_c[0] = fixed_first
-                                # MCU segnaposto per mantenere n_mcu
-                                ph = [[(b2b[2], 0, [], True) for b2b in blocks] for _ in range(lost)]
+                                seen, fixed = set(), []
+                                for (ci2, d2, ac2, eob2) in tail_c[0]:
+                                    if ci2 not in seen: d2 += delta_s[ci2]; seen.add(ci2)
+                                    fixed.append((ci2, d2, ac2, eob2))
+                                tail_c[0] = fixed
+                                ph = [[(bb[2], 0, [], True) for bb in blocks] for _ in range(lost)]
                                 rec = _encode_interval(head_coeffs + ph + tail_c, blocks, enc)
                                 if rec is not None:
                                     piece = rec.replace(b"\xff\x00", b"\xff")
                                     kept += keep + target
                                     bad.append((k, n_mcu, keep, keep + lost))
                                     p = [0, 0, 0]
-                                    for mcu_r in head_coeffs + ph + tail_c:
-                                        for (ci2, d2, _a, _e) in mcu_r: p[ci2] += d2
-                                    prev_last_dc = tuple(p)
-                                    sync_done = True
+                                    for mr in head_coeffs + ph + tail_c:
+                                        for (ci2, d2, _a, _e) in mr: p[ci2] += d2
+                                    prev_last_dc = tuple(p); sync_done = True
                 if not sync_done:
                     kept += keep
                     piece = _cut_bits(buf, starts[keep] if keep < len(starts) else pos)
                     bad.append((k, n_mcu, keep, n_mcu))
-                    if not sync_done:
-                        if reason is None or not dc_incoherent:
-                            prev_last_dc = last_dc
-                        else:
-                            prev_last_dc = None
-                continue
-
-            if reason is None or not dc_incoherent:
-                prev_last_dc = last_dc
-            else:
-                prev_last_dc = None
-
+                    prev_last_dc = None if dc_incoherent else last_dc
         out += piece.replace(b"\xff", b"\xff\x00")
     out += b"\xff\xd9"
     return bytes(out), kept / params["mcus"], bad
@@ -1015,18 +995,56 @@ def _guarded(fn_rgb, name: str, log: list,
     log.append(f"{name}: neon {n_before}->{n_after} detail {d_before:.1f}->{d_after:.1f}")
     return rgb_out
 
-def fix_interval_dc(rgb: np.ndarray, mcu_h: int = 16, thr: float = 5.0) -> np.ndarray:
-    """Corregge DC drift pixel-domain: rimuove salti di luminosità sui bordi MCU."""
+def _dc_offsets(lab, mcu_h=16, thr=5.0, max_off=30.0, min_agree=0.55,
+                min_corr=0.60, valid=None, rows_per_interval=1, roi_rows=None):
+    H, W = lab.shape[:2]
+    valid = np.ones((H, W), bool) if valid is None else valid.astype(bool)
+    n_rows = (H + mcu_h - 1) // mcu_h            # ceil: 3480 non è multiplo di 16
+    k = max(2, min(8, mcu_h // 2))
+    jumps = np.zeros((n_rows, 3), np.float32)
+    for j in range(1, n_rows):
+        y = j * mcu_h
+        if y + k > H: break
+        if roi_rows is not None and not roi_rows[j]: continue
+        m = valid[y] & valid[y - 1]
+        if m.sum() < 0.25 * W: continue
+        d = lab[y][m] - lab[y - 1][m]
+        med = np.median(d, axis=0)
+        if np.max(np.abs(med)) <= thr: continue
+        if np.max(np.abs(med)) > max_off: continue        # bordo reale, non drift
+        mad = float(np.median(np.abs(d[:, 0] - med[0])) * 1.4826)
+        if np.mean(np.abs(d[:, 0] - med[0]) <= max(3.0, 2.0 * mad)) < min_agree:
+            continue                                      # salto non uniforme
+        a = lab[y-k:y, :, 0].mean(0); b = lab[y:y+k, :, 0].mean(0)
+        a = a - a.mean(); b = b - b.mean()
+        na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+        noise_prof = mad / np.sqrt(2.0 * k) * np.sqrt(W)
+        if max(na, nb) > 2.5 * noise_prof:                # c'è struttura: verifica che continui
+            c = 0.0 if min(na, nb) < 1e-6 else float(np.dot(a, b) / (na * nb))
+            if c < min_corr: continue
+        jumps[j] = med
+    off_row = np.zeros((n_rows, 3), np.float32); acc = np.zeros(3, np.float32)
+    for j in range(n_rows):
+        if rows_per_interval and j % rows_per_interval == 0: acc[:] = 0   # reset a inizio intervallo
+        acc = np.clip(acc + jumps[j], -max_off, max_off)
+        off_row[j] = acc
+    if not np.any(off_row): return None
+    return np.repeat(off_row, mcu_h, axis=0)[:H][:, None, :]   # (H,1,3) broadcastabile
+
+def fix_interval_dc(rgb, mcu_h=16, damage_mask=None, rows_per_interval=1, use_roi=True):
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     H = lab.shape[0]
-    off = np.zeros((H, 3), np.float32)
-    for y in range(mcu_h, H - mcu_h, mcu_h):
-        d = np.median(lab[y].astype(np.float32) - lab[y - 1].astype(np.float32), axis=0)
-        if abs(d[0]) > thr or abs(d[1]) > thr or abs(d[2]) > thr:
-            off[y:y + mcu_h] = d
-    off = cv2.GaussianBlur(off, (1, 31), 0)
-    corrected = np.clip(lab - off, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(corrected, cv2.COLOR_LAB2RGB)
+    valid = None if damage_mask is None else (damage_mask == 0)
+    roi_rows = None
+    if use_roi and damage_mask is not None and damage_mask.any():
+        rd = damage_mask.any(axis=1)
+        n = (H + mcu_h - 1) // mcu_h
+        roi_rows = np.array([rd[max(0, j*mcu_h-mcu_h):min(H, (j+1)*mcu_h+mcu_h)].any()
+                             for j in range(n)])
+    off = _dc_offsets(lab, mcu_h=mcu_h, valid=valid,
+                      rows_per_interval=rows_per_interval, roi_rows=roi_rows)
+    if off is None: return rgb                      # ← no-op: foto sane intatte
+    return cv2.cvtColor(np.clip(lab - off, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
 
 def mask_thin_row_glitches(rgb: np.ndarray, thr: int = 14, min_len: int = 40) -> np.ndarray:
     return mask_row_bands(rgb, thr=thr)
@@ -1134,7 +1152,7 @@ def blend_masked(orig: Image.Image, new: Image.Image, mask_np: np.ndarray, feath
 
 def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = None,
                        report=None, force=False, visual=True, ref_path=None,
-                       mcu_grid: int = 16):
+                       mcu_grid: int = 16, rows_per_interval: int = 1):
     if cv2 is None: return None
     rep = report or (lambda frac, msg: None)
     
@@ -1145,9 +1163,10 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
     
     rep(0.10, "analyzing image for visual and structural defects")
 
-    # FIX4: DC drift pixel-domain — rimuove bande velate alla fonte, prima delle maschere
-    if visual:
-        rgb = fix_interval_dc(rgb, mcu_h=mcu_grid)
+    # FIX4: DC drift pixel-domain — rimuove bande velate alla fonte, solo se c'è danno strutturale accertato
+    if visual and structural_mask is not None and structural_mask.any():
+        rgb = fix_interval_dc(rgb, mcu_h=mcu_grid, damage_mask=structural_mask,
+                              rows_per_interval=rows_per_interval)
         im = Image.fromarray(rgb)
 
     mask_combined = np.zeros((h, w), dtype=np.uint8)
@@ -1333,6 +1352,7 @@ def process(path: Path, outdir: Path, opts: Options | None = None, report=None) 
     rep(0.05, "checking binary structure")
     structural_mask = None
     mcu_grid = 16
+    rows_per_interval = 1
     
     if opts.repair_binary:
         try:
@@ -1347,6 +1367,8 @@ def process(path: Path, outdir: Path, opts: Options | None = None, report=None) 
                         params = baseline_params(data, segs)
                         if params:
                             mcu_grid = 8 * params.get("vmax", 2)
+                            ri, mx = params.get("ri", 0), params.get("mx", 1)
+                            rows_per_interval = max(1, ri // mx) if (ri and mx and ri % mx == 0) else 1
                             suspect = jpeg_damaged(data)
                             results = check_baseline(data, segs, params, lambda f, m: rep(0.05 + 0.15 * f, m), strict=bool(suspect))
                             if any(r[2] for r in results):
@@ -1388,7 +1410,7 @@ def process(path: Path, outdir: Path, opts: Options | None = None, report=None) 
     if opts.reconstruct and cv2 is not None and image is not None:
         rec = reconstruct_pixels(image, structural_mask, lambda frac, msg: rep(0.3 + 0.6 * frac, msg), 
                                  force=opts.force_repair, visual=True, ref_path=opts.reference_path,
-                                 mcu_grid=mcu_grid)
+                                 mcu_grid=mcu_grid, rows_per_interval=rows_per_interval)
         if rec is not None:
             res, share, engine, mask_combined, error_log = rec
             details.extend(error_log)
