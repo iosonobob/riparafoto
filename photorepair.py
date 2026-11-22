@@ -767,9 +767,18 @@ def _shift_bits(buf: bytes, k: int) -> bytes:
     if n + 1 >= len(a): return b""
     return (((a[n:-1].astype(np.uint16) << r) | (a[n+1:] >> (8 - r))) & 0xFF).astype(np.uint8).tobytes()
 
-def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=512, max_lost=6, probe=6):
+def _ac_energy(mcu):
+    if mcu is None: return None
+    e = [0.0, 0.0, 0.0]
+    for ci, diff, ac, eob in mcu:
+        if ci < 3:
+            e[ci] += sum(abs(v) for _, _, v in ac)
+    return e
+
+def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=1024, max_lost=6, probe=6, ref_mcu_above=None):
     rem = n_mcu - n_ok
     best = None
+    e_ref = _ac_energy(ref_mcu_above) if ref_mcu_above is not None else None
     for lost in range(1, min(max_lost, rem - probe) + 1):
         target = rem - lost
         for skip in range(window):
@@ -778,11 +787,23 @@ def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=512, max_l
             m, _s, _r, _p, fdc, _l = _decode_interval(b2, probe, blocks, 10**6, 10**6)
             if m < probe or fdc is None: continue
             d = [pred_fail[ci] - fdc[ci] for ci in range(min(3, len(pred_fail), len(fdc)))]
-            cost = sum(abs(x) for x in d) + 0.25 * skip + 40 * lost
+            cost = abs(d[0]) + 0.5 * (abs(d[1]) + abs(d[2])) + 0.25 * skip + 40 * lost
+            if e_ref is not None:
+                probe_c, _ = _decode_coeffs(b2, 1, blocks)
+                if probe_c:
+                    e_new = _ac_energy(probe_c[0])
+                    if e_new is not None:
+                        cost += 0.15 * sum(abs(a - b) for a, b in zip(e_ref, e_new))
             if best is None or cost < best[0]:
                 best = (cost, lost, skip, d, b2, target)
         if best is not None and best[0] < 120: break
     return best
+
+def _degrade_ac(mcus_coeffs, idx_start, n_mcu, bad, k):
+    for m in range(len(mcus_coeffs)):
+        mcus_coeffs[m] = [(ci, diff, [], True) for (ci, diff, _ac, _eob) in mcus_coeffs[m]]
+        bad.append((k, n_mcu, idx_start + m, idx_start + m + 1))
+    return mcus_coeffs
 
 def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
     ecs_i = next(i for i, s in enumerate(segs) if s.marker is None)
@@ -793,8 +814,13 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
     bad: list[tuple[int, int, int, int]] = []
     enc = params.get("enc") or _enc_tables(params.get("dht", {}))
     blocks = params["blocks"]
+    ri = params.get("ri", 0)
+    mx = params.get("mx", 1)
+    all_mcus = {}
+
     for k, (n_ok, starts, reason, pos, first_dc, last_dc, buf, n_mcu) in enumerate(results):
         if k: out += bytes([0xFF, 0xD0 + (k - 1) % 8])
+        idx_base = k * ri if ri else 0
         dc_incoherent = False
         if reason is not None and prev_last_dc is not None and first_dc is not None and n_ok > 0:
             for ci in range(min(len(prev_last_dc), len(first_dc))):
@@ -810,6 +836,8 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
                 coeffs, _ = _decode_coeffs(buf, n_target, blocks)
                 if len(coeffs) == n_target:
                     recoded = _encode_interval(coeffs, blocks, enc, dc_shift=delta)
+                    for m_idx, m_c in enumerate(coeffs):
+                        all_mcus[idx_base + m_idx] = m_c
             if recoded is not None:
                 # FIX1: _BitW già fa stuffing → normalizza prima di re-stuffare
                 piece = recoded.replace(b"\xff\x00", b"\xff")
@@ -822,18 +850,44 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
         if recoded is None:
             if reason is None:
                 kept += n_mcu; piece = buf; prev_last_dc = last_dc
+                # Memorizza coeffs se riusciamo a estrarli
+                coeffs_ok, _ = _decode_coeffs(buf, n_mcu, blocks)
+                for m_idx, m_c in enumerate(coeffs_ok):
+                    all_mcus[idx_base + m_idx] = m_c
             elif reason == "excess data":
                 kept += n_mcu; piece = _cut_bits(buf, pos); prev_last_dc = last_dc
+                coeffs_ok, _ = _decode_coeffs(buf, n_mcu, blocks)
+                for m_idx, m_c in enumerate(coeffs_ok):
+                    all_mcus[idx_base + m_idx] = m_c
             elif dc_incoherent:
-                piece = b""; bad.append((k, n_mcu, 0, n_mcu)); prev_last_dc = None
+                # Passo 3: degrado AC dei blocchi sospetti invece di scartare l'intero intervallo
+                degraded = False
+                if enc:
+                    coeffs_dec, _ = _decode_coeffs(buf, n_mcu, blocks)
+                    if len(coeffs_dec) > 0:
+                        degraded_coeffs = _degrade_ac(coeffs_dec, 0, n_mcu, bad, k)
+                        rec = _encode_interval(degraded_coeffs, blocks, enc)
+                        if rec is not None:
+                            piece = rec.replace(b"\xff\x00", b"\xff")
+                            kept += len(degraded_coeffs)
+                            degraded = True
+                if not degraded:
+                    piece = b""; bad.append((k, n_mcu, 0, n_mcu))
+                prev_last_dc = None
             else:
                 keep = max(0, n_ok - margin)
                 sync_done = False
                 if enc and 0 < keep < n_mcu - 1 and len(starts) > keep:
                     head_coeffs, _ = _decode_coeffs(buf, keep, blocks)
                     if len(head_coeffs) == keep:
+                        for m_idx, m_c in enumerate(head_coeffs):
+                            all_mcus[idx_base + m_idx] = m_c
+                        # Passo 4: cerca MCU verticalmente adiacente sopra
+                        cand_raster = idx_base + n_ok + 1
+                        ref_above = all_mcus.get(cand_raster - mx) if cand_raster >= mx else None
                         sync = _resync_interval(buf, n_mcu, n_ok, pos,
-                                                last_dc or (0, 0, 0), blocks, window=1024)
+                                                last_dc or (0, 0, 0), blocks, window=1024,
+                                                ref_mcu_above=ref_above)
                         if sync is not None:
                             _c, lost, _s, delta_s, b2, target = sync
                             tail_c, _ = _decode_coeffs(b2, target, blocks)
@@ -853,12 +907,16 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
                                     for mr in head_coeffs + ph + tail_c:
                                         for (ci2, d2, _a, _e) in mr: p[ci2] += d2
                                     prev_last_dc = tuple(p); sync_done = True
+                                    for m_idx, m_c in enumerate(tail_c):
+                                        all_mcus[idx_base + keep + lost + m_idx] = m_c
                 if not sync_done:
                     kept += keep
                     piece = _cut_bits(buf, starts[keep] if keep < len(starts) else pos)
                     bad.append((k, n_mcu, keep, n_mcu))
                     prev_last_dc = None if dc_incoherent else last_dc
         out += piece.replace(b"\xff", b"\xff\x00")
+    out += b"\xff\xd9"
+    return bytes(out), kept / params["mcus"], bad
     out += b"\xff\xd9"
     return bytes(out), kept / params["mcus"], bad
 
@@ -949,6 +1007,24 @@ def mask_row_bands(rgb: np.ndarray, thr: int = 12, min_frac: float = 0.10,
         return mask_row_bands(rgb, thr + 6, min_frac * 1.6, max_band, grow, roi, grid, budget)
     return mask
 
+def mask_bad_blocks(rgb, mcu=16, k=6.0, roi=None, budget=0.05):
+    ycc = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb).astype(np.float32)
+    H, W = ycc.shape[:2]
+    ny, nx = (H + mcu - 1) // mcu, (W + mcu - 1) // mcu
+    pad = np.pad(ycc, ((0, ny*mcu-H), (0, nx*mcu-W), (0, 0)), mode='edge')
+    blk = pad.reshape(ny, mcu, nx, mcu, 3).mean(axis=(1, 3))
+    med = cv2.medianBlur(blk, 5)
+    dev = np.abs(blk - med)
+    scale = np.median(dev, axis=(0, 1)) * 1.4826 + 1e-3
+    z = dev / scale
+    bad = (z[..., 1] > k) | (z[..., 2] > k) | (z[..., 0] > k * 1.5)
+    if roi is not None:
+        rp = np.pad(roi, ((0, ny*mcu-H), (0, nx*mcu-W)), mode='edge')
+        bad &= rp.reshape(ny, mcu, nx, mcu).max(axis=(1, 3)) > 0
+    m = np.repeat(np.repeat(bad, mcu, 0), mcu, 1)[:H, :W].astype(np.uint8) * 255
+    m = cv2.dilate(m, np.ones((5, 5), np.uint8))
+    return m if m.mean() / 255 <= budget else np.zeros_like(m)
+
 def mask_chroma_spots(rgb: np.ndarray, thr: int = 45, sat_min: int = 150,
                       max_area: int = 60, max_total: float = 0.0005) -> np.ndarray:
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
@@ -970,12 +1046,12 @@ def neon_score(rgb: np.ndarray) -> int:
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     return int(((hsv[:, :, 1] > 190) & (hsv[:, :, 2] > 190)).sum())
 
-def detail_score(rgb: np.ndarray, healthy: np.ndarray | None = None) -> float:
+def detail_score(rgb, healthy=None) -> float:
     g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     lap = cv2.Laplacian(g, cv2.CV_32F)
     if healthy is not None and healthy.any():
-        return float(lap[healthy].var())
-    return float(lap.var())
+        return float(np.mean(np.abs(lap[healthy])))
+    return float(np.mean(np.abs(lap)))
 
 def _guarded(fn_rgb, name: str, log: list,
              neon_thr: float = 1.05, neon_margin: int = 200,
@@ -1190,6 +1266,11 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
         mask_combined = np.maximum(mask_combined, glitch)
         error_log.append(f"maschera righe: {int((glitch > 0).sum())} pixel")
 
+    blocks_m = mask_bad_blocks(rgb, mcu=mcu_grid, roi=roi) if visual else np.zeros((h, w), dtype=np.uint8)
+    if blocks_m.any():
+        mask_combined = np.maximum(mask_combined, blocks_m)
+        error_log.append(f"maschera blocchi: {int((blocks_m > 0).sum())} pixel")
+
     if mask_combined.max() == 0:
         return None
 
@@ -1216,7 +1297,7 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
             if glitch.any():
                 res = blend_masked(res, inpainted_img, glitch, feather=3)
 
-            # Pass 2/3: re-detect stripes (guarded on neon + detail)
+            # Pass 2/3: re-detect stripes (guarded on neon + detail con insieme dinamico)
             if visual:
                 for pass_idx in range(2):
                     rgb_cur = np.array(res.convert("RGB"))
@@ -1228,8 +1309,10 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
                         return np.array(blend_masked(Image.fromarray(r),
                                         Image.fromarray(lama_inpaint_tiled(_lama, r, _again)),
                                         _again, feather=3).convert("RGB"))
+                    hc = ((mask_combined == 0) & (again == 0)).astype(np.uint8)
+                    hc = cv2.erode(hc, np.ones((9, 9), np.uint8)).astype(bool)
                     rgb_cur = _guarded((rgb_cur, _do_pass), f"pass{pass_idx+2}", error_log,
-                                       healthy=healthy)
+                                       healthy=hc)
                     res = Image.fromarray(rgb_cur)
 
             engine = f"LaMa (GPU {DEVICE.upper()})"
@@ -1254,15 +1337,17 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
     # FIX5: cleanup bande PRIMA di GFPGAN (non sovrascrivere volti restaurati)
     if visual:
         rgb_out = np.array(res.convert("RGB"))
-        def _do_bands(r):
-            bands = mask_row_bands(r, roi=roi, grid=mcu_grid)
-            if not bands.any(): return r
-            inp = (lama_inpaint_tiled(lama, r, bands, 768, 192)
-                   if lama is not None else cv2.inpaint(r, bands, 3, cv2.INPAINT_TELEA))
-            return np.array(blend_masked(Image.fromarray(r), Image.fromarray(inp),
-                                         bands, feather=3).convert("RGB"))
-        rgb_out = _guarded((rgb_out, _do_bands), "cleanup-bande", error_log, healthy=healthy)
-        res = Image.fromarray(rgb_out)
+        bands = mask_row_bands(rgb_out, roi=roi, grid=mcu_grid)
+        if bands.any():
+            def _do_bands(r, _b=bands):
+                inp = (lama_inpaint_tiled(lama, r, _b, 768, 192)
+                       if lama is not None else cv2.inpaint(r, _b, 3, cv2.INPAINT_TELEA))
+                return np.array(blend_masked(Image.fromarray(r), Image.fromarray(inp),
+                                             _b, feather=3).convert("RGB"))
+            hc_b = ((mask_combined == 0) & (bands == 0)).astype(np.uint8)
+            hc_b = cv2.erode(hc_b, np.ones((9, 9), np.uint8)).astype(bool)
+            rgb_out = _guarded((rgb_out, _do_bands), "cleanup-bande", error_log, healthy=hc_b)
+            res = Image.fromarray(rgb_out)
 
     # FIX5: GFPGAN con soglie più alte per evitare falsi positivi
     from photorepair_extras import restore_faces_selective
