@@ -967,8 +967,13 @@ def repair_baseline(data: bytes, segs, params, results, margin: int = 2):
 
 # --------------------------------------------------------------------------- B) Pixel Reconstruction & Inpainting
 
-def _find_visual_glitches_safe(a: np.ndarray, force: bool = False) -> np.ndarray:
-    """Accurately detects visual defects (corrupted flat areas, decoder fills, neon glitches)."""
+def _find_visual_glitches_safe(a: np.ndarray, force: bool = False, strict: bool = False) -> np.ndarray:
+    """Accurately detects visual defects (corrupted flat areas, decoder fills, neon glitches).
+
+    With strict=True (used when the file shows no binary evidence of damage) the
+    thresholds tighten further: flat 128/0 fills have local variance near 0, while
+    any real photo texture keeps local variance well above 5.
+    """
     h, w, _ = a.shape
     gray = cv2.cvtColor(a, cv2.COLOR_RGB2GRAY).astype(np.float32)
     hsv = cv2.cvtColor(a, cv2.COLOR_RGB2HSV)
@@ -979,14 +984,16 @@ def _find_visual_glitches_safe(a: np.ndarray, force: bool = False) -> np.ndarray
     variance = np.maximum(0, sq_blur - blur**2)
 
     # 1. Indicator colors typical of decoder fills or stream corruption
-    is_gray = (np.abs(a[:, :, 0].astype(int) - 128) < 4) & \
-              (np.abs(a[:, :, 1].astype(int) - 128) < 4) & \
-              (np.abs(a[:, :, 2].astype(int) - 128) < 4)
-    is_black = (a[:, :, 0] < 3) & (a[:, :, 1] < 3) & (a[:, :, 2] < 3)
-    is_neon = (hsv[:, :, 1] > 200) & (hsv[:, :, 2] > 180)
+    gray_tol, black_max, fill_var, neon_s, neon_v, neon_var = (
+        (3, 2, 0.5, 220, 200, 10.0) if strict else (4, 3, 2.0, 200, 180, 40.0))
+    is_gray = (np.abs(a[:, :, 0].astype(int) - 128) < gray_tol) & \
+              (np.abs(a[:, :, 1].astype(int) - 128) < gray_tol) & \
+              (np.abs(a[:, :, 2].astype(int) - 128) < gray_tol)
+    is_black = (a[:, :, 0] < black_max) & (a[:, :, 1] < black_max) & (a[:, :, 2] < black_max)
+    is_neon = (hsv[:, :, 1] > neon_s) & (hsv[:, :, 2] > neon_v)
 
     # Defect: flat fills OR noisy saturated desync spikes
-    damage = (((is_gray | is_black) & (variance < 2.0)) | (is_neon & (variance < 40.0))).astype(np.uint8) * 255
+    damage = (((is_gray | is_black) & (variance < fill_var)) | (is_neon & (variance < neon_var))).astype(np.uint8) * 255
     if force:
         is_white = (a[:, :, 0] > 248) & (a[:, :, 1] > 248) & (a[:, :, 2] > 248)
         damage = np.maximum(damage, (is_white & (variance < 5.0)).astype(np.uint8) * 255)
@@ -1257,12 +1264,11 @@ from photorepair_extras import restore_faces_selective
 
 def blend_masked(orig: Image.Image, new: Image.Image, mask_np: np.ndarray, feather: int = 15) -> Image.Image:
     """Seamlessly blends new content over the original, preserving unmasked healthy pixels."""
-    k = feather if feather % 2 == 1 else feather + 1
-    m = cv2.GaussianBlur(mask_np.astype(np.float32) / 255.0, (k, k), 0)
-    er = cv2.erode(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    if mask_np.any() and er.max() == 0:
-        er = (mask_np > 0).astype(np.float32)
-    m = er[..., None]
+    feather = max(feather, 1)
+    binm = (mask_np > 0).astype(np.uint8)
+    dist = cv2.distanceTransform(binm, cv2.DIST_L2, 3)
+    ramp = min(feather * 0.5, max(float(dist.max()), 1e-3))
+    m = np.clip(dist / ramp, 0.0, 1.0)[..., None]
     o = np.asarray(orig.convert("RGB"), np.float32)
     n = np.asarray(new.convert("RGB").resize(orig.size, Image.LANCZOS), np.float32)
     res = o * (1.0 - m) + n * m
@@ -1274,10 +1280,10 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
     if cv2 is None: return None
     rep = report or (lambda frac, msg: None)
     
-    # Require structural_mask, force, or evidence before running visual detection
-    has_structural = structural_mask is not None and structural_mask.any()
-    if visual and not (has_structural or force or evidence):
-        visual = False
+    # Without binary evidence or force the visual detection runs in strict mode:
+    # decoder fills have local variance near 0, healthy photo texture stays above 5.
+    strict_visual = visual and not (force or evidence or
+                                    (structural_mask is not None and structural_mask.any()))
     
     alpha = im.getchannel("A") if "A" in im.getbands() else None
     im = im.convert("RGB")
@@ -1298,7 +1304,7 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
         
     vis_mask = None
     if visual:
-        vis_mask = _find_visual_glitches_safe(rgb, force=force)
+        vis_mask = _find_visual_glitches_safe(rgb, force=force, strict=strict_visual)
         mask_combined = np.maximum(mask_combined, vis_mask)
 
     error_log = []
@@ -1557,7 +1563,7 @@ def process(path: Path, outdir: Path, opts: Options | None = None, report=None) 
 
     if opts.reconstruct and cv2 is not None and image is not None:
         rec = reconstruct_pixels(image, structural_mask, lambda frac, msg: rep(0.3 + 0.6 * frac, msg), 
-                                 force=opts.force_repair, visual=bool(evidence), ref_path=opts.reference_path,
+                                 force=opts.force_repair, visual=True, ref_path=opts.reference_path,
                                  mcu_grid=mcu_grid, rows_per_interval=rows_per_interval, evidence=bool(evidence))
         if rec is not None:
             res, share, engine, mask_combined, error_log = rec
