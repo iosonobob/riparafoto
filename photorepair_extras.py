@@ -220,15 +220,20 @@ def restore_faces_selective(
         if logger: logger(f"[GFPGAN] errore paste-back: {e}")
         return rgb_out, face_info
 
-    # Blend specifically only inside restored face boxes
+    # Blend specifically only inside restored face boxes intersecting damaged pixels
     restored_mask = np.zeros((h, w), dtype=np.float32)
     for idx in restore_indices:
         x1, y1, x2, y2 = face_info[idx]["box"]
         bx1, by1 = max(0, x1), max(0, y1)
         bx2, by2 = min(w, x2), min(h, y2)
-        restored_mask[by1:by2, bx1:bx2] = 1.0
+        if mask is not None and mask.any():
+            box_dmg = (mask[by1:by2, bx1:bx2] > 0).astype(np.uint8)
+            box_dmg = cv2.dilate(box_dmg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+            restored_mask[by1:by2, bx1:bx2] = np.maximum(restored_mask[by1:by2, bx1:bx2], box_dmg.astype(np.float32))
+        else:
+            restored_mask[by1:by2, bx1:bx2] = 1.0
 
-    restored_mask = cv2.GaussianBlur(restored_mask, (21, 21), 0)[..., None]
+    restored_mask = cv2.GaussianBlur(restored_mask, (15, 15), 0)[..., None]
     total_w = keep_real + strength
     w_orig = keep_real / total_w if total_w > 0 else 0.3
     w_rest = strength / total_w if total_w > 0 else 0.7

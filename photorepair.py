@@ -979,17 +979,17 @@ def _find_visual_glitches_safe(a: np.ndarray, force: bool = False) -> np.ndarray
     variance = np.maximum(0, sq_blur - blur**2)
 
     # 1. Indicator colors typical of decoder fills or stream corruption
-    is_gray = (np.abs(a[:, :, 0].astype(int) - 128) < 10) & \
-              (np.abs(a[:, :, 1].astype(int) - 128) < 10) & \
-              (np.abs(a[:, :, 2].astype(int) - 128) < 10)
-    is_black = (a[:, :, 0] < 6) & (a[:, :, 1] < 6) & (a[:, :, 2] < 6)
-    is_neon = (hsv[:, :, 1] > 170) & (hsv[:, :, 2] > 170)
+    is_gray = (np.abs(a[:, :, 0].astype(int) - 128) < 4) & \
+              (np.abs(a[:, :, 1].astype(int) - 128) < 4) & \
+              (np.abs(a[:, :, 2].astype(int) - 128) < 4)
+    is_black = (a[:, :, 0] < 3) & (a[:, :, 1] < 3) & (a[:, :, 2] < 3)
+    is_neon = (hsv[:, :, 1] > 200) & (hsv[:, :, 2] > 180)
 
     # Defect: flat fills OR noisy saturated desync spikes
-    damage = (((is_gray | is_black) & (variance < 5.0)) | (is_neon & (variance < 80.0))).astype(np.uint8) * 255
+    damage = (((is_gray | is_black) & (variance < 2.0)) | (is_neon & (variance < 40.0))).astype(np.uint8) * 255
     if force:
         is_white = (a[:, :, 0] > 248) & (a[:, :, 1] > 248) & (a[:, :, 2] > 248)
-        damage = np.maximum(damage, (is_white & (variance < 10.0)).astype(np.uint8) * 255)
+        damage = np.maximum(damage, (is_white & (variance < 5.0)).astype(np.uint8) * 255)
 
     # 2. Morphological cleanup: 3x3 kernel preserves thin structures
     damage = cv2.morphologyEx(damage, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
@@ -1258,8 +1258,11 @@ from photorepair_extras import restore_faces_selective
 def blend_masked(orig: Image.Image, new: Image.Image, mask_np: np.ndarray, feather: int = 15) -> Image.Image:
     """Seamlessly blends new content over the original, preserving unmasked healthy pixels."""
     k = feather if feather % 2 == 1 else feather + 1
-    m = cv2.GaussianBlur(mask_np.astype(np.float32) / 255.0, (k, k), 0)[..., None]
-    m = np.maximum(m, (mask_np > 0).astype(np.float32)[..., None])
+    m = cv2.GaussianBlur(mask_np.astype(np.float32) / 255.0, (k, k), 0)
+    er = cv2.erode(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    if mask_np.any() and er.max() == 0:
+        er = (mask_np > 0).astype(np.float32)
+    m = er[..., None]
     o = np.asarray(orig.convert("RGB"), np.float32)
     n = np.asarray(new.convert("RGB").resize(orig.size, Image.LANCZOS), np.float32)
     res = o * (1.0 - m) + n * m
@@ -1267,9 +1270,14 @@ def blend_masked(orig: Image.Image, new: Image.Image, mask_np: np.ndarray, feath
 
 def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = None,
                        report=None, force=False, visual=True, ref_path=None,
-                       mcu_grid: int = 16, rows_per_interval: int = 1):
+                       mcu_grid: int = 16, rows_per_interval: int = 1, evidence: bool = False):
     if cv2 is None: return None
     rep = report or (lambda frac, msg: None)
+    
+    # Require structural_mask, force, or evidence before running visual detection
+    has_structural = structural_mask is not None and structural_mask.any()
+    if visual and not (has_structural or force or evidence):
+        visual = False
     
     alpha = im.getchannel("A") if "A" in im.getbands() else None
     im = im.convert("RGB")
@@ -1324,11 +1332,13 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
     
     if lama is not None:
         try:
-            rep(0.40, "running LaMa tiled inpainting at native resolution...")
-            inpainted_np = lama_inpaint_tiled(lama, rgb, mask_combined)
+            rep(0.40, "running LaMa hybrid inpainting at native resolution...")
+            inpainted_np = lama_inpaint_hybrid(lama, rgb, mask_combined)
             inpainted_img = Image.fromarray(inpainted_np)
             mask_base = np.maximum(structural_mask if structural_mask is not None else 0,
                                    vis_mask if vis_mask is not None else 0)
+            if blocks_m is not None and blocks_m.any():
+                mask_base = np.maximum(mask_base, blocks_m)
             if mask_base.any():
                 res = blend_masked(im, inpainted_img, mask_base, feather=15)
             else:
@@ -1336,11 +1346,13 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
             if glitch.any():
                 res = blend_masked(res, inpainted_img, glitch, feather=3)
 
+            already_inpainted = (mask_combined > 0).copy()
             # Pass 2/3: re-detect stripes (guarded on neon + detail con insieme dinamico)
             if visual:
                 for pass_idx in range(2):
                     rgb_cur = np.array(res.convert("RGB"))
                     again = mask_row_bands(rgb_cur, roi=roi, grid=mcu_grid)
+                    again[already_inpainted] = 0
                     if (again > 0).mean() < 0.0005:
                         break
                     error_log.append(f"pass {pass_idx+2} righe residue: {int((again > 0).sum())} pixel")
@@ -1352,6 +1364,7 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
                     hc = cv2.erode(hc, np.ones((9, 9), np.uint8)).astype(bool)
                     rgb_cur = _guarded((rgb_cur, _do_pass), f"pass{pass_idx+2}", error_log,
                                        healthy=hc)
+                    already_inpainted |= (again > 0)
                     res = Image.fromarray(rgb_cur)
 
             engine = f"LaMa (GPU {DEVICE.upper()})"
@@ -1365,6 +1378,8 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
         repaired_img = Image.fromarray(repaired)
         mask_base = np.maximum(structural_mask if structural_mask is not None else 0,
                                vis_mask if vis_mask is not None else 0)
+        if blocks_m is not None and blocks_m.any():
+            mask_base = np.maximum(mask_base, blocks_m)
         if mask_base.any():
             res = blend_masked(im, repaired_img, mask_base, feather=11)
         else:
@@ -1377,6 +1392,8 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
     if visual:
         rgb_out = np.array(res.convert("RGB"))
         bands = mask_row_bands(rgb_out, roi=roi, grid=mcu_grid)
+        if 'already_inpainted' in locals():
+            bands[already_inpainted] = 0
         if bands.any():
             def _do_bands(r, _b=bands):
                 inp = (lama_inpaint_tiled(lama, r, _b, 768, 192)
@@ -1386,6 +1403,8 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
             hc_b = ((mask_combined == 0) & (bands == 0)).astype(np.uint8)
             hc_b = cv2.erode(hc_b, np.ones((9, 9), np.uint8)).astype(bool)
             rgb_out = _guarded((rgb_out, _do_bands), "cleanup-bande", error_log, healthy=hc_b)
+            if 'already_inpainted' in locals():
+                already_inpainted |= (bands > 0)
             res = Image.fromarray(rgb_out)
 
     # FIX5: GFPGAN con soglie più alte per evitare falsi positivi
@@ -1538,8 +1557,8 @@ def process(path: Path, outdir: Path, opts: Options | None = None, report=None) 
 
     if opts.reconstruct and cv2 is not None and image is not None:
         rec = reconstruct_pixels(image, structural_mask, lambda frac, msg: rep(0.3 + 0.6 * frac, msg), 
-                                 force=opts.force_repair, visual=True, ref_path=opts.reference_path,
-                                 mcu_grid=mcu_grid, rows_per_interval=rows_per_interval)
+                                 force=opts.force_repair, visual=bool(evidence), ref_path=opts.reference_path,
+                                 mcu_grid=mcu_grid, rows_per_interval=rows_per_interval, evidence=bool(evidence))
         if rec is not None:
             res, share, engine, mask_combined, error_log = rec
             details.extend(error_log)
