@@ -726,6 +726,20 @@ def _split_intervals(raw: bytes):
     parts[k] = raw[start:]
     return parts, merged
 
+def _dc_jump_limits(blocks) -> tuple[int, int]:
+    """Physically possible DC-jump bound between adjacent blocks, in quantized units.
+
+    The 8x8 DCT DC covers a mean-pixel range of 255 levels, so the widest content-driven
+    jump is ~255*8/q0 quantized units. Anything above is decoder garbage. Fixed
+    thresholds (400/700) sit below this bound on high-quality files (low q0) and
+    discard valid content on high-contrast photos.
+    """
+    q0_l = blocks[0][3][0] if blocks else 2
+    q0_c = next((b[3][0] for b in reversed(blocks) if b[2] != 0), q0_l)
+    def _bound(q0: int) -> int:
+        return int(255.0 * 8 / max(1, q0)) + 64
+    return _bound(q0_l), _bound(q0_c)
+
 def check_baseline(data: bytes, segs, params, report=None, strict: bool = False):
     ecs = next(s for s in segs if s.marker is None)
     ri, total = params["ri"], params["mcus"]
@@ -735,8 +749,7 @@ def check_baseline(data: bytes, segs, params, report=None, strict: bool = False)
 
     def mcus_in(k): return (ri if k < expected - 1 else total - ri * (expected - 1)) if ri else total
 
-    dc_luma = 400 if strict else 700
-    dc_chroma = 200 if strict else 350
+    dc_luma, dc_chroma = _dc_jump_limits(params["blocks"])
 
     results, carry = [], None
     for k in range(expected):
@@ -780,14 +793,19 @@ def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=4096, max_
     if rem <= probe: return None, "too_few_remaining"
     best = None
     e_ref = _ac_energy(ref_mcu_above) if ref_mcu_above is not None else None
-    max_lost_val = min(max_lost if max_lost is not None else rem - probe, rem - probe)
+    max_lost_val = min(max_lost if max_lost is not None else rem - probe, rem - probe, 16)
     for lost in range(0, max_lost_val + 1):
         target = rem - lost
         thresh = 150.0 + 25.0 * lost + 1.0 * target
         for skip in range(window):
             b2 = _shift_bits(buf, pos + skip)
             if len(b2) < 8: break
-            m, _s, _r, _p, fdc, _l = _decode_interval(b2, probe, blocks, 10**6, 10**6)
+            m1probe, _s, _r1, _p, f1dc, _l = _decode_interval(b2, 1, blocks, 10**6, 10**6)
+            if m1probe < 1 or f1dc is None: continue
+            if probe > 1:
+                m, _s, _r, _p, fdc, _l = _decode_interval(b2, probe, blocks, 10**6, 10**6)
+            else:
+                m, fdc = m1probe, f1dc
             if m < probe or fdc is None: continue
             d = [pred_fail[ci] - fdc[ci] for ci in range(min(3, len(pred_fail), len(fdc)))]
             cost = abs(d[0]) + 0.5 * (abs(d[1]) + abs(d[2])) + 0.20 * skip + 25.0 * lost
@@ -839,13 +857,16 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
         }
     }
 
+    dc_lim_l, dc_lim_c = _dc_jump_limits(blocks)
     for k, (n_ok, starts, reason, pos, first_dc, last_dc, buf, n_mcu) in enumerate(results):
         if k: out += bytes([0xFF, 0xD0 + (k - 1) % 8])
         idx_base = k * ri if ri else 0
         dc_incoherent = False
-        if reason is not None and prev_last_dc is not None and first_dc is not None and n_ok > 0:
+        # With restart intervals the DC predictors reset at every RST: the boundary
+        # jump between rows is image content, there is no drift to correct.
+        if ri == 0 and reason is not None and prev_last_dc is not None and first_dc is not None and n_ok > 0:
             for ci in range(min(len(prev_last_dc), len(first_dc))):
-                if abs(prev_last_dc[ci] - first_dc[ci]) > 400:
+                if abs(prev_last_dc[ci] - first_dc[ci]) > (dc_lim_l if ci == 0 else dc_lim_c):
                     dc_incoherent = True
                     break
         
@@ -900,8 +921,8 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
                 sync_done = False
                 if enc and 0 < keep < n_mcu - 1 and len(starts) > keep:
                     resync_stats["attempted"] += 1
-                    head_m, _, head_r, _, _, _ = _decode_interval(buf, keep, blocks)
-                    if head_r is None and head_m == keep:
+                    head_m, _, head_r, _, _, _ = _decode_interval(buf, keep, blocks, dc_jump_luma=dc_lim_l, dc_jump_chroma=dc_lim_c)
+                    if head_r in (None, "excess data") and head_m == keep:
                         head_coeffs, _ = _decode_coeffs(buf, keep, blocks)
                         if len(head_coeffs) == keep:
                             for m_idx, m_c in enumerate(head_coeffs):
@@ -910,7 +931,7 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
                             cand_raster = idx_base + n_ok + 1
                             ref_above = all_mcus.get(cand_raster - mx) if cand_raster >= mx else None
                             sync, fail_reason = _resync_interval(buf, n_mcu, n_ok, pos,
-                                                                 last_dc or (0, 0, 0), blocks, window=4096,
+                                                                 last_dc or (0, 0, 0), blocks, window=768,
                                                                  probe=4, ref_mcu_above=ref_above)
                             if sync is not None:
                                 _c, lost, _s, delta_s, b2, target = sync
