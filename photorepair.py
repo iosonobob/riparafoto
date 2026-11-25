@@ -946,7 +946,28 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
                                         fixed.append((ci2, d2, ac2, eob2))
                                     tail_c[0] = fixed
                                     total_lost = n_mcu - keep - actual
-                                    ph = [[(bb[2], 0, [], True) for bb in blocks] for _ in range(total_lost)]
+                                    # DC-ramp placeholders: interpolate the flat band from
+                                    # the head tone to the first tail tone instead of a
+                                    # hard flat band (visible banding artifact).
+                                    p_head = [0, 0, 0]
+                                    for mr in head_coeffs:
+                                        for (ci2, d2, _a, _e) in mr: p_head[ci2] += d2
+                                    step = [(-delta_s[ci2]) / (total_lost + 1)
+                                            for ci2 in range(min(3, len(p_head), len(delta_s)))]
+                                    cur = p_head[:len(step)]
+                                    ph = []
+                                    for _i in range(total_lost):
+                                        ref_m = all_mcus.get(idx_base + keep + _i - mx)
+                                        mr_ph = []
+                                        for j, bb in enumerate(blocks):
+                                            ci2 = bb[2]
+                                            d = int(round(step[ci2])) if ci2 < len(step) else 0
+                                            if ci2 < len(cur): cur[ci2] += d
+                                            ac2, e2 = [], True
+                                            if ref_m is not None and j < len(ref_m) and ref_m[j][0] == ci2:
+                                                ac2, e2 = ref_m[j][2], ref_m[j][3]
+                                            mr_ph.append((ci2, d, ac2, e2))
+                                        ph.append(mr_ph)
                                     rec = _encode_interval(head_coeffs + ph + tail_c, blocks, enc)
                                     if rec is not None:
                                         piece = rec.replace(b"\xff\x00", b"\xff")
@@ -976,8 +997,25 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
                     resync_stats["cut"] += 1
                     kept += keep
                     piece = _cut_bits(buf, starts[keep] if keep < len(starts) else pos)
-                    bad.append((k, n_mcu, keep, n_mcu))
                     prev_last_dc = None if dc_incoherent else last_dc
+                    if keep and enc:
+                        head_c, _ = _decode_coeffs(buf, keep, blocks)
+                        if head_c and len(head_c) == keep:
+                            ph2 = []
+                            for _i in range(n_mcu - keep):
+                                ref_m = all_mcus.get(idx_base + keep + _i - mx)
+                                mr_ph = []
+                                for j, bb in enumerate(blocks):
+                                    ac2, e2 = [], True
+                                    if ref_m is not None and j < len(ref_m) and ref_m[j][0] == bb[2]:
+                                        ac2, e2 = ref_m[j][2], ref_m[j][3]
+                                    mr_ph.append((bb[2], 0, ac2, e2))
+                                ph2.append(mr_ph)
+                            rec2 = _encode_interval(head_c + ph2, blocks, enc)
+                            if rec2 is not None:
+                                piece = rec2.replace(b"\xff\x00", b"\xff")
+                                kept += n_mcu - keep
+                    bad.append((k, n_mcu, keep, n_mcu))
         out += piece.replace(b"\xff", b"\xff\x00")
     params["resync_stats"] = resync_stats
     out += b"\xff\xd9"
