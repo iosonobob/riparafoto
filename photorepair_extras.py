@@ -90,6 +90,7 @@ def restore_faces_selective(
     strength: float = 0.7,
     keep_real: float = 0.3,
     max_damage: float = 0.60,
+    gfp_weight: float = 0.5,
     logger=None,
 ) -> tuple[np.ndarray, list[dict]]:
     """
@@ -204,7 +205,7 @@ def restore_faces_selective(
             normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
             cropped_face_t = cropped_face_t.unsqueeze(0).to(gfpgan.device)
             with torch.no_grad():
-                output = gfpgan.gfpgan(cropped_face_t, return_rgb=False, weight=0.5)[0]
+                output = gfpgan.gfpgan(cropped_face_t, return_rgb=False, weight=gfp_weight)[0]
                 out_img = output.squeeze(0).permute(1, 2, 0).clamp_(-1, 1).add_(1).div_(2).mul_(255)
                 out_bgr = out_img.cpu().numpy().astype(np.uint8)[:, :, [2, 1, 0]]
                 face_helper.add_restored_face(out_bgr)

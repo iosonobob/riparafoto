@@ -51,6 +51,15 @@ except ImportError:
     DEVICE = "cpu"
 
 DEVICE_OBJ = torch.device(DEVICE) if TORCH_AVAILABLE else None
+
+# --- GFPGAN selective-restore tunables (single source of truth; used by
+# reconstruct_pixels -> restore_faces_selective; tweak them here or via UI). ---
+FACE_DET_THR = 0.60
+FACE_MIN_DAMAGE = 0.05
+FACE_MAX_DAMAGE = 0.60
+FACE_STRENGTH = 0.7
+FACE_KEEP_REAL = 0.3
+FACE_GFP_WEIGHT = 0.5
 print(f"\n{'='*60}")
 if DEVICE == "cuda":
     gpu_name = torch.cuda.get_device_name(0)
@@ -549,11 +558,21 @@ def _encode_interval(mcus, blocks, enc, dc_shift=None):
                 c, ln = enc[(1, ta)][0]; bw.put(c, ln)
     return bw.flush()
 
+# 24-bit rolling word table used by the Huffman decoders (indexed by byte
+# position, 300 zero words of padding). Vectorized with numpy: building words
+# from a 4 KB slice is far faster than the pure-Python list comprehension it
+# replaces, and the old version made every resync probe pay for the WHOLE
+# interval buffer, which dominated repair time on large files.
+def _bit_words(buf: bytes) -> list:
+    padded = buf + bytes(3)
+    a = np.frombuffer(padded, np.uint8).astype(np.uint32)
+    w = (a[:-2] << 16) | (a[1:-1] << 8) | a[2:]
+    return np.concatenate([w, np.zeros(300, np.uint32)]).tolist()
+
 def _decode_coeffs(buf: bytes, n_mcus: int, blocks):
     nbits = len(buf) * 8
     padded = buf + bytes(3)
-    words = [(padded[i] << 16) | (padded[i + 1] << 8) | padded[i + 2] for i in range(len(buf) + 1)]
-    words.extend([0] * 300)
+    words = _bit_words(buf)
     pos, pred = 0, [0, 0, 0]
     mcus = []
     for m in range(n_mcus):
@@ -661,8 +680,7 @@ def baseline_params(data: bytes, segs):
 def _decode_interval(buf: bytes, n_mcus: int, blocks, dc_jump_luma: int = 700, dc_jump_chroma: int = 350):
     nbits = len(buf) * 8
     padded = buf + bytes(3)
-    words = [(padded[i] << 16) | (padded[i + 1] << 8) | padded[i + 2] for i in range(len(buf) + 1)]
-    words.extend([0] * 300)
+    words = _bit_words(buf)
     pos, pred, starts = 0, [0, 0, 0], []
     prev_pred = None
     first_dc = None
@@ -798,7 +816,12 @@ def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=4096, max_
         target = rem - lost
         thresh = 150.0 + 25.0 * lost + 1.0 * target
         for skip in range(window):
-            b2 = _shift_bits(buf, pos + skip)
+            bpos = pos + skip
+            nb = bpos >> 3
+            # Probe on a bounded slice: _decode_interval with 4 MCUs never needs
+            # more than a few KB; scanning the whole buffer per skip was the
+            # dominant cost (O(window * len(buf)) bit-shifts).
+            b2 = _shift_bits(buf[nb:nb + 4096], bpos & 7)
             if len(b2) < 8: break
             m1probe, _s, _r1, _p, f1dc, _l = _decode_interval(b2, 1, blocks, 10**6, 10**6)
             if m1probe < 1 or f1dc is None: continue
@@ -816,13 +839,16 @@ def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=4096, max_
                     if e_new is not None:
                         cost += 0.15 * sum(abs(a - b) for a, b in zip(e_ref, e_new))
             if best is None or cost < best[0]:
-                best = (cost, lost, skip, d, b2, target, thresh)
+                best = (cost, lost, skip, d, target, thresh)
         if best is not None and best[0] < thresh: break
     if best is None:
         return None, "probe_not_found"
-    if best[0] >= best[6]:
+    if best[0] >= best[5]:
         return None, "cost_above_threshold"
-    return best[:6], None
+    _cost, lost, skip, d, target, thresh = best
+    # Recompute the full shifted buffer for the winner only (used by the
+    # caller to decode up to `target` MCUs, which a bounded slice cannot hold).
+    return (best[0], lost, skip, d, _shift_bits(buf, pos + skip), target), None
 
 def _degrade_ac(mcus_coeffs, idx_start, n_mcu, bad, k):
     for m in range(len(mcus_coeffs)):
@@ -1135,6 +1161,11 @@ def mask_bad_blocks(rgb, mcu=16, k=6.0, roi=None, budget=0.05):
         bad &= rp.reshape(ny, mcu, nx, mcu).max(axis=(1, 3)) > 0
     m = np.repeat(np.repeat(bad, mcu, 0), mcu, 1)[:H, :W].astype(np.uint8) * 255
     m = cv2.dilate(m, np.ones((5, 5), np.uint8))
+    if roi is not None:
+        # ROI comes from the structural loss map: those blocks are already known
+        # to be damaged, so the texture-shock budget must not zero them out
+        # (with real SD-card damage the budget was always exceeded -> empty mask).
+        return m
     return m if m.mean() / 255 <= budget else np.zeros_like(m)
 
 def mask_chroma_spots(rgb: np.ndarray, thr: int = 45, sat_min: int = 150,
@@ -1421,13 +1452,26 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
             already_inpainted = (mask_combined > 0).copy()
             # Pass 2/3: re-detect stripes (guarded on neon + detail con insieme dinamico)
             if visual:
+                before_pass = None   # frame state before the previous pass
                 for pass_idx in range(2):
                     rgb_cur = np.array(res.convert("RGB"))
+                    if before_pass is not None:
+                        _da = np.abs(rgb_cur.astype(np.int16) - before_pass.astype(np.int16))
+                        _changed = float((_da.max(axis=2) > 2).mean())
+                        before_pass = None
+                        if _changed < 0.05:
+                            # Previous pass changed almost nothing: further passes
+                            # would burn a full LaMa run for no visible gain.
+                            error_log.append(
+                                f"pass {pass_idx + 2} skipped: previous pass changed "
+                                f"only {_changed:.2%} of pixels")
+                            break
                     again = mask_row_bands(rgb_cur, roi=roi, grid=mcu_grid)
                     again[already_inpainted] = 0
                     if (again > 0).mean() < 0.0005:
                         break
                     error_log.append(f"pass {pass_idx+2} righe residue: {int((again > 0).sum())} pixel")
+                    before_pass = rgb_cur
                     def _do_pass(r, _again=again, _lama=lama):
                         return np.array(blend_masked(Image.fromarray(r),
                                         Image.fromarray(lama_inpaint_tiled(_lama, r, _again)),
@@ -1487,11 +1531,12 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
         rgb_out = np.array(res.convert("RGB"))
         rgb_out, face_info = restore_faces_selective(
             rgb_out, mask_combined, gfpgan,
-            det_thr=0.60,       # alzata: evita split di volti parziali
-            min_damage=0.05,    # almeno 5% del box deve essere danneggiato
-            max_damage=0.60,    # skip se troppo rovinato (pochi pixel affidabili)
-            strength=0.7,
-            keep_real=0.3,
+            det_thr=FACE_DET_THR,         # alzata: evita split di volti parziali
+            min_damage=FACE_MIN_DAMAGE,   # almeno N% del box deve essere danneggiato
+            max_damage=FACE_MAX_DAMAGE,   # skip se troppo rovinato (pochi pixel affidabili)
+            strength=FACE_STRENGTH,
+            keep_real=FACE_KEEP_REAL,
+            gfp_weight=FACE_GFP_WEIGHT,
             logger=error_log.append,
         )
         res = Image.fromarray(rgb_out)
