@@ -936,18 +936,21 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
                             if sync is not None:
                                 _c, lost, _s, delta_s, b2, target = sync
                                 tail_c, _ = _decode_coeffs(b2, target, blocks)
-                                if len(tail_c) == target:
+                                # Partial tail: keep what decoded before the next error,
+                                # cover only the remainder with placeholder blocks.
+                                if tail_c and len(tail_c) <= target:
+                                    actual = len(tail_c)
                                     seen, fixed = set(), []
                                     for (ci2, d2, ac2, eob2) in tail_c[0]:
                                         if ci2 not in seen: d2 += delta_s[ci2]; seen.add(ci2)
                                         fixed.append((ci2, d2, ac2, eob2))
                                     tail_c[0] = fixed
-                                    total_lost = n_mcu - keep - target
+                                    total_lost = n_mcu - keep - actual
                                     ph = [[(bb[2], 0, [], True) for bb in blocks] for _ in range(total_lost)]
                                     rec = _encode_interval(head_coeffs + ph + tail_c, blocks, enc)
                                     if rec is not None:
                                         piece = rec.replace(b"\xff\x00", b"\xff")
-                                        kept += keep + target
+                                        kept += keep + actual
                                         bad.append((k, n_mcu, keep, keep + total_lost))
                                         p = [0, 0, 0]
                                         for mr in head_coeffs + ph + tail_c:
@@ -1046,7 +1049,11 @@ def mask_row_bands(rgb: np.ndarray, thr: int = 12, min_frac: float = 0.10,
     dev = np.minimum(np.abs(lab - up).max(2), np.abs(lab - dn).max(2))
     cand = (dev > thr).astype(np.uint8)
     if roi is not None:
-        cand = cand * (roi > 0).astype(np.uint8)   # solo vicino al danno noto
+        # ROI gates at band level (not per pixel): damaged rows keep their
+        # out-of-ROI streak columns detectable, e.g. the unmasked head part of
+        # a partially resynced interval.
+        row_hit = (roi > 0).any(axis=1)
+        cand = cand * row_hit[:, None].astype(np.uint8)
     frac = cand.mean(1)
     core, edge = frac > min_frac, frac > grow
     mask = np.zeros((h, w), np.uint8)
