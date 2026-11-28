@@ -806,10 +806,12 @@ def _ac_energy(mcu):
             e[ci] += sum(abs(v) for _, _, v in ac)
     return e
 
-def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=4096, max_lost=None, probe=4, ref_mcu_above=None):
+def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=4096, max_lost=None, probe=4, ref_mcu_above=None,
+                     dc_bounds=None, relax=False):
     rem = n_mcu - n_ok
     if rem <= probe: return None, "too_few_remaining"
     best = None
+    rel_costs = []   # costs of every valid candidate (for the relative criterion)
     e_ref = _ac_energy(ref_mcu_above) if ref_mcu_above is not None else None
     max_lost_val = min(max_lost if max_lost is not None else rem - probe, rem - probe, 16)
     for lost in range(0, max_lost_val + 1):
@@ -840,11 +842,39 @@ def _resync_interval(buf, n_mcu, n_ok, pos, pred_fail, blocks, window=4096, max_
                         cost += 0.15 * sum(abs(a - b) for a, b in zip(e_ref, e_new))
             if best is None or cost < best[0]:
                 best = (cost, lost, skip, d, target, thresh)
+            rel_costs.append(cost)
         if best is not None and best[0] < thresh: break
     if best is None:
         return None, "probe_not_found"
     if best[0] >= best[5]:
-        return None, "cost_above_threshold"
+        if not relax:
+            return None, "cost_above_threshold"
+        # Relative acceptance: the absolute threshold is calibrated for smooth
+        # content; on busy photos the true resync point can exceed it. A
+        # candidate is accepted only if ALL evidence checks agree (calibrated
+        # on real files where pixel-level ground truth was available):
+        #  (a) physically plausible: DC jumps within the q-table bounds,
+        #  (b) close to the absolute threshold (<= 1.5x): correct-but-busy
+        #      resyncs landed at 1.0-1.4x, wrong ones at 1.8x and beyond,
+        #  (c) a clear cost outlier vs the other candidates (<= 0.7x median):
+        #      misaligned bitstreams produce uniformly high costs,
+        #  (d) a substantial part of the tail decodes (>= 40%): garbage dies
+        #      within a few MCUs with invalid Huffman codes; whatever does not
+        #      decode is placeholdered and masked by the caller anyway.
+        _cost, lost, skip, d, target, thresh = best
+        if dc_bounds is not None and d:
+            dl, dcb = dc_bounds
+            if abs(d[0]) > dl or any(abs(x) > dcb for x in d[1:]):
+                return None, "cost_above_threshold"
+        if best[0] > 1.5 * thresh:
+            return None, "cost_above_threshold"
+        if rel_costs and best[0] > 0.7 * float(np.median(rel_costs)):
+            return None, "cost_above_threshold"
+        b2 = _shift_bits(buf, pos + skip)
+        tail_c, _e = _decode_coeffs(b2, target, blocks)
+        if target <= 0 or len(tail_c) < 0.4 * target:
+            return None, "cost_above_threshold"
+        return (best[0], lost, skip, d, b2, target), "accepted_relative"
     _cost, lost, skip, d, target, thresh = best
     # Recompute the full shifted buffer for the winner only (used by the
     # caller to decode up to `target` MCUs, which a bounded slice cannot hold).
@@ -876,6 +906,7 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
             "head_decode_failed": 0,
             "probe_not_found": 0,
             "cost_above_threshold": 0,
+            "accepted_relative": 0,
             "tail_decode_failed": 0,
             "encode_failed": 0,
             "no_enc_or_bounds": 0,
@@ -958,8 +989,11 @@ def repair_baseline_v3(data: bytes, segs, params, results, margin: int = 2):
                             ref_above = all_mcus.get(cand_raster - mx) if cand_raster >= mx else None
                             sync, fail_reason = _resync_interval(buf, n_mcu, n_ok, pos,
                                                                  last_dc or (0, 0, 0), blocks, window=768,
-                                                                 probe=4, ref_mcu_above=ref_above)
+                                                                 probe=4, ref_mcu_above=ref_above,
+                                                                 dc_bounds=(dc_lim_l, dc_lim_c), relax=True)
                             if sync is not None:
+                                if fail_reason == "accepted_relative":
+                                    resync_stats["reasons"]["accepted_relative"] += 1
                                 _c, lost, _s, delta_s, b2, target = sync
                                 tail_c, _ = _decode_coeffs(b2, target, blocks)
                                 # Partial tail: keep what decoded before the next error,
