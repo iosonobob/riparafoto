@@ -60,6 +60,18 @@ FACE_MAX_DAMAGE = 0.60
 FACE_STRENGTH = 0.7
 FACE_KEEP_REAL = 0.3
 FACE_GFP_WEIGHT = 0.5
+
+# --- LaMa band-inpainting tunables (single source of truth) ---
+# LAMA_CONTEXT: the mask handed to LaMa is dilated by this many pixels. The ring
+# (a) removes undetected damaged pixels from LaMa's trusted context (LaMa was
+# propagating the very corruption adjacent to the strips), and (b) widens narrow
+# strips so LaMa has room to synthesize texture instead of echoing its input.
+# The ring's output is discarded by the blend, which uses the precise mask.
+LAMA_CONTEXT = 8
+# BLEND_FEATHER_STRUCT: blend_masked ramps from original to LaMa INSIDE the
+# mask, so a large feather keeps a large fraction of the damaged content. With
+# feather=15 a 16-row MCU band kept ~43% of the placeholder; 6 keeps ~14%.
+BLEND_FEATHER_STRUCT = 6
 print(f"\n{'='*60}")
 if DEVICE == "cuda":
     gpu_name = torch.cuda.get_device_name(0)
@@ -1320,12 +1332,19 @@ def _structural_mask_from_intervals(im: Image.Image, bad, params: dict) -> np.nd
     mx = params.get("mx", (im.size[0] + 8 * params.get("hmax", 2) - 1) // (8 * params.get("hmax", 2)))
     return mask_from_lost(im.size[0], im.size[1], params, bad, ri, mx)
 
-def lama_inpaint_tiled(lama, rgb: np.ndarray, mask: np.ndarray, tile_size: int = 1024, overlap: int = 256) -> np.ndarray:
+def lama_inpaint_tiled(lama, rgb: np.ndarray, mask: np.ndarray, tile_size: int = 1024, overlap: int = 256,
+                       context: int = LAMA_CONTEXT) -> np.ndarray:
     if lama is None or mask.max() == 0:
         return rgb.copy()
     h, w = rgb.shape[:2]
+    # Context dilation: LaMa must not treat undetected damaged pixels as
+    # trusted context, and narrow strips give it no room to synthesize.
+    if context > 0:
+        mask_in = cv2.dilate(mask, np.ones((2 * context + 1, 2 * context + 1), np.uint8))
+    else:
+        mask_in = mask
     if h <= tile_size and w <= tile_size:
-        rec = lama(Image.fromarray(rgb), Image.fromarray(mask))
+        rec = lama(Image.fromarray(rgb), Image.fromarray(mask_in))
         return np.array(rec)
 
     def _slices(length: int, tlen: int, ov: int) -> list[tuple[int, int]]:
@@ -1347,7 +1366,7 @@ def lama_inpaint_tiled(lama, rgb: np.ndarray, mask: np.ndarray, tile_size: int =
 
     for y1, y2 in y_slices:
         for x1, x2 in x_slices:
-            tile_mask = mask[y1:y2, x1:x2]
+            tile_mask = mask_in[y1:y2, x1:x2]
             if tile_mask.max() == 0:
                 continue
 
@@ -1376,13 +1395,15 @@ def lama_inpaint_tiled(lama, rgb: np.ndarray, mask: np.ndarray, tile_size: int =
     inpainted[has_w] = accum_img[has_w] / accum_weight[has_w, None]
     return np.clip(inpainted, 0, 255).astype(np.uint8)
 
-def lama_inpaint_hybrid(lama, rgb: np.ndarray, mask: np.ndarray, tile: int = 1024, overlap: int = 256, gmax: int = 1536) -> np.ndarray:
-    local = lama_inpaint_tiled(lama, rgb, mask, tile, overlap)
+def lama_inpaint_hybrid(lama, rgb: np.ndarray, mask: np.ndarray, tile: int = 1024, overlap: int = 256, gmax: int = 1536,
+                        context: int = LAMA_CONTEXT) -> np.ndarray:
+    local = lama_inpaint_tiled(lama, rgb, mask, tile, overlap, context)
     if (mask > 0).mean() < 0.12: return local
     s = gmax / max(rgb.shape[:2])
     if s >= 1: return local
+    mask_in = cv2.dilate(mask, np.ones((2 * context + 1, 2 * context + 1), np.uint8)) if context > 0 else mask
     small = cv2.resize(rgb, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-    smask = cv2.resize(mask, None, fx=s, fy=s, interpolation=cv2.INTER_NEAREST)
+    smask = cv2.resize(mask_in, None, fx=s, fy=s, interpolation=cv2.INTER_NEAREST)
     g = np.array(lama(Image.fromarray(small), Image.fromarray(smask)))
     g = cv2.resize(g, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LANCZOS4)
     lf = cv2.GaussianBlur(g, (0, 0), 24)
@@ -1470,6 +1491,7 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
     if lama is not None:
         try:
             rep(0.40, "running LaMa hybrid inpainting at native resolution...")
+            error_log.append(f"LaMa: mask context +{LAMA_CONTEXT}px, structural blend feather {BLEND_FEATHER_STRUCT}px")
             inpainted_np = lama_inpaint_hybrid(lama, rgb, mask_combined)
             inpainted_img = Image.fromarray(inpainted_np)
             mask_base = np.maximum(structural_mask if structural_mask is not None else 0,
@@ -1477,7 +1499,7 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
             if blocks_m is not None and blocks_m.any():
                 mask_base = np.maximum(mask_base, blocks_m)
             if mask_base.any():
-                res = blend_masked(im, inpainted_img, mask_base, feather=15)
+                res = blend_masked(im, inpainted_img, mask_base, feather=BLEND_FEATHER_STRUCT)
             else:
                 res = im
             if glitch.any():
@@ -1531,7 +1553,7 @@ def reconstruct_pixels(im: Image.Image, structural_mask: np.ndarray | None = Non
         if blocks_m is not None and blocks_m.any():
             mask_base = np.maximum(mask_base, blocks_m)
         if mask_base.any():
-            res = blend_masked(im, repaired_img, mask_base, feather=11)
+            res = blend_masked(im, repaired_img, mask_base, feather=BLEND_FEATHER_STRUCT)
         else:
             res = im
         if glitch.any():
